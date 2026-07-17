@@ -19,7 +19,6 @@ except:
     BASE = "https://fapi.binance.com"
     PROXY_LIST = []
 
-# ========== НАСТРОЙКИ ==========
 settings = {
     "pump": {
         "price": 1.0,
@@ -86,7 +85,7 @@ def rotate_proxy():
         print("All proxies dead")
         return None
     proxy = random.choice(available)
-    print(f"PROXY: {proxy}")
+    # print(f"PROXY: {proxy}")  # <-- УБРАЛ
     return proxy
 
 async def safe_request(session, url, params=None, retries=3):
@@ -95,14 +94,14 @@ async def safe_request(session, url, params=None, retries=3):
         try:
             async with session.get(url, params=params, timeout=10, proxy=proxy) as response:
                 if response.status in [403, 429]:
-                    print(f"Status {response.status}. Rotating proxy.")
+                    # print(f"Status {response.status}. Rotating proxy.")  # <-- УБРАЛ
                     if proxy:
                         dead_proxies.add(proxy)
                     await asyncio.sleep(1)
                     continue
                 return await response.json()
         except Exception as e:
-            print(f"Request error: {e}. Rotating proxy.")
+            # print(f"Request error: {e}. Rotating proxy.")  # <-- УБРАЛ
             if proxy:
                 dead_proxies.add(proxy)
             await asyncio.sleep(1)
@@ -410,11 +409,12 @@ def can_send_signal(symbol, mode):
 # ========== СКАНЕР ==========
 async def scanner(app):
     async with aiohttp.ClientSession() as session:
+        print("✅ Бот запущен и мониторит рынок...")
         while True:
             if scanner_running:
                 try:
                     symbols = await get_symbols(session)
-                    print(f"🔄 Scanning {len(symbols)} coins...")
+                    # print(f"🔄 Scanning {len(symbols)} coins...")  # <-- УБРАЛ
                     
                     for symbol in symbols:
                         s_pump = settings["pump"]
@@ -487,7 +487,8 @@ async def scanner(app):
                         
                         await asyncio.sleep(0.01)
                 except Exception as e:
-                    print(f"SCAN ERROR: {e}")
+                    # print(f"SCAN ERROR: {e}")  # <-- УБРАЛ
+                    pass
             await asyncio.sleep(30)
 
 # ========== ОТПРАВКА СИГНАЛА ==========
@@ -625,7 +626,6 @@ Imbalance: {ws['imbalance']:.1f} %
 OrderBook Pressure: {pressure}
 """
         
-        # Добавляем кнопку меню в каждый сигнал
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
         ])
@@ -765,7 +765,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del waiting_for[chat_id]
         save_settings()
         
-        # Возвращаем меню настроек после сохранения
         menu_map = {
             "pump": pump_menu,
             "dump": dump_menu,
@@ -792,4 +791,9 @@ async def post_init(app):
     asyncio.create_task(scanner(app))
 
 app = Application.builder().token(TOKEN).post_init(post_init).build()
-app.add_handler(Command
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+print("🚀 BOT STARTED")
+app.run_polling()
