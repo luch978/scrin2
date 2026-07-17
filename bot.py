@@ -407,7 +407,7 @@ def can_send_signal(symbol, mode):
     last_signal_time[key] = now
     return True
 
-# ========== ОСНОВНОЙ СКАНЕР ==========
+# ========== СКАНЕР ==========
 async def scanner(app):
     async with aiohttp.ClientSession() as session:
         while True:
@@ -421,7 +421,7 @@ async def scanner(app):
                         s_dump = settings["dump"]
                         s_vol = settings["vol"]
                         
-                        # ===== PUMP =====
+                        # PUMP
                         if s_pump["active"]:
                             interval = f"{s_pump['time']}m"
                             klines = await get_klines(session, symbol, interval, 2)
@@ -449,7 +449,7 @@ async def scanner(app):
                                             "oi_data": oi
                                         })
                         
-                        # ===== DUMP =====
+                        # DUMP
                         if s_dump["active"]:
                             interval = f"{s_dump['time']}m"
                             klines = await get_klines(session, symbol, interval, 2)
@@ -465,7 +465,7 @@ async def scanner(app):
                                             "klines": klines
                                         })
                         
-                        # ===== VOLUME =====
+                        # VOLUME
                         if s_vol["active"]:
                             klines = await get_klines(session, symbol, s_vol["tf"], s_vol["candles"] + 1)
                             if len(klines) >= s_vol["candles"] + 1:
@@ -625,16 +625,20 @@ Imbalance: {ws['imbalance']:.1f} %
 OrderBook Pressure: {pressure}
 """
         
-        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+        # Добавляем кнопку меню в каждый сигнал
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
+        ])
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=keyboard)
     except Exception as e:
         print(f"Send signal error {symbol}: {e}")
 
 # ========== МЕНЮ ==========
 def main_menu():
-    status = "RUNNING" if scanner_running else "STOPPED"
+    status = "RUNNING ✅" if scanner_running else "STOPPED ❌"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"SCANNER: {status}", callback_data="toggle_scanner")],
-        [InlineKeyboardButton("📊 STATUS", callback_data="status")],
+        [InlineKeyboardButton(f"⚡ СКАНЕР: {status}", callback_data="toggle_scanner")],
+        [InlineKeyboardButton("📊 СТАТУС", callback_data="status")],
         [InlineKeyboardButton("🔧 PUMP", callback_data="pump_menu")],
         [InlineKeyboardButton("🔧 DUMP", callback_data="dump_menu")],
         [InlineKeyboardButton("🔧 VOL", callback_data="vol_menu")]
@@ -646,18 +650,18 @@ def pump_menu():
         [InlineKeyboardButton("TIME MIN", callback_data="pump_time")],
         [InlineKeyboardButton("VOLUME USDT", callback_data="pump_volume")],
         [InlineKeyboardButton("OI %", callback_data="pump_oi")],
-        [InlineKeyboardButton("START", callback_data="pump_start")],
-        [InlineKeyboardButton("STOP", callback_data="pump_stop")],
-        [InlineKeyboardButton("📊 BACK", callback_data="main")]
+        [InlineKeyboardButton("▶️ START", callback_data="pump_start")],
+        [InlineKeyboardButton("⏹ STOP", callback_data="pump_stop")],
+        [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
     ])
 
 def dump_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("PRICE %", callback_data="dump_price")],
         [InlineKeyboardButton("TIME MIN", callback_data="dump_time")],
-        [InlineKeyboardButton("START", callback_data="dump_start")],
-        [InlineKeyboardButton("STOP", callback_data="dump_stop")],
-        [InlineKeyboardButton("📊 BACK", callback_data="main")]
+        [InlineKeyboardButton("▶️ START", callback_data="dump_start")],
+        [InlineKeyboardButton("⏹ STOP", callback_data="dump_stop")],
+        [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
     ])
 
 def vol_menu():
@@ -666,43 +670,44 @@ def vol_menu():
         [InlineKeyboardButton("CANDLES", callback_data="vol_candles")],
         [InlineKeyboardButton("MAX OLD VOL", callback_data="vol_max_old_volume")],
         [InlineKeyboardButton("MIN NEW VOL", callback_data="vol_min_new_volume")],
-        [InlineKeyboardButton("START", callback_data="vol_start")],
-        [InlineKeyboardButton("STOP", callback_data="vol_stop")],
-        [InlineKeyboardButton("📊 BACK", callback_data="main")]
+        [InlineKeyboardButton("▶️ START", callback_data="vol_start")],
+        [InlineKeyboardButton("⏹ STOP", callback_data="vol_stop")],
+        [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
     ])
 
 def status_text():
     total = len(symbols_cache["data"]) if symbols_cache["data"] else 0
+    status = "RUNNING ✅" if scanner_running else "STOPPED ❌"
     return f"""
-SCREENER STATUS
-================
-SCANNER: {'RUNNING' if scanner_running else 'STOPPED'}
+📊 СТАТУС СКАНЕРА
+==================
+⚡ СКАНЕР: {status}
 
-PUMP
-  Price: {settings['pump']['price']}%
-  Time: {settings['pump']['time']} min
-  Volume: {settings['pump']['volume']:,} USDT
+🔧 PUMP
+  Цена: {settings['pump']['price']}%
+  Время: {settings['pump']['time']} мин
+  Объём: {settings['pump']['volume']:,} USDT
   OI: {settings['pump']['oi']}%
-  Active: {settings['pump']['active']}
+  Активен: {'✅' if settings['pump']['active'] else '❌'}
 
-DUMP (SHORT сигналы)
-  Price: {settings['dump']['price']}%
-  Time: {settings['dump']['time']} min
-  Active: {settings['dump']['active']}
+🔧 DUMP
+  Цена: {settings['dump']['price']}%
+  Время: {settings['dump']['time']} мин
+  Активен: {'✅' if settings['dump']['active'] else '❌'}
 
-VOLUME
+🔧 VOLUME
   TF: {settings['vol']['tf']}
-  Candles: {settings['vol']['candles']}
-  Max Vol: {settings['vol']['max_old_volume']:,}
-  Min Vol: {settings['vol']['min_new_volume']:,}
-  Active: {settings['vol']['active']}
+  Свечей: {settings['vol']['candles']}
+  Max Vol: {settings['vol']['max_old_volume']:,} USDT
+  Min Vol: {settings['vol']['min_new_volume']:,} USDT
+  Активен: {'✅' if settings['vol']['active'] else '❌'}
 
-COINS: {total}
-INTERVAL: 30 sec
+📊 МОНЕТ: {total}
+⏱ ИНТЕРВАЛ: 30 сек
 """
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("SCREENER MENU", reply_markup=main_menu())
+    await update.message.reply_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu())
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global scanner_running
@@ -711,32 +716,35 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     if data == "main":
-        await query.edit_message_text("SCREENER MENU", reply_markup=main_menu())
+        await query.edit_message_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu())
     elif data == "toggle_scanner":
         scanner_running = not scanner_running
-        await query.edit_message_text(f"SCANNER: {'RUNNING' if scanner_running else 'STOPPED'}", reply_markup=main_menu())
+        status = "RUNNING ✅" if scanner_running else "STOPPED ❌"
+        await query.edit_message_text(f"⚡ СКАНЕР: {status}", reply_markup=main_menu())
     elif data == "status":
         await query.edit_message_text(status_text(), reply_markup=main_menu())
     elif data == "pump_menu":
-        await query.edit_message_text("PUMP SETTINGS", reply_markup=pump_menu())
+        await query.edit_message_text("🔧 PUMP НАСТРОЙКИ", reply_markup=pump_menu())
     elif data == "dump_menu":
-        await query.edit_message_text("DUMP SETTINGS", reply_markup=dump_menu())
+        await query.edit_message_text("🔧 DUMP НАСТРОЙКИ", reply_markup=dump_menu())
     elif data == "vol_menu":
-        await query.edit_message_text("VOL SETTINGS", reply_markup=vol_menu())
+        await query.edit_message_text("🔧 VOLUME НАСТРОЙКИ", reply_markup=vol_menu())
     elif data.endswith("_start"):
         mode = data.split("_")[0]
         settings[mode]["active"] = True
         save_settings()
-        await query.edit_message_text(f"{mode.upper()} STARTED", reply_markup=main_menu())
+        await query.edit_message_text(f"✅ {mode.upper()} ЗАПУЩЕН", reply_markup=main_menu())
     elif data.endswith("_stop"):
         mode = data.split("_")[0]
         settings[mode]["active"] = False
         save_settings()
-        await query.edit_message_text(f"{mode.upper()} STOPPED", reply_markup=main_menu())
+        await query.edit_message_text(f"❌ {mode.upper()} ОСТАНОВЛЕН", reply_markup=main_menu())
     elif "_" in data:
         mode, key = data.split("_", 1)
         waiting_for[query.message.chat_id] = (mode, key)
-        await query.message.reply_text("SEND VALUE:")
+        await query.edit_message_text(f"📝 ВВЕДИТЕ ЗНАЧЕНИЕ ДЛЯ {key.upper()}:")
+    else:
+        await query.edit_message_text("❌ НЕИЗВЕСТНАЯ КОМАНДА", reply_markup=main_menu())
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
@@ -747,19 +755,34 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if key == "tf":
             value = update.message.text.strip()
             if value not in ["1m", "3m", "5m"]:
-                await update.message.reply_text("ONLY: 1m, 3m, 5m")
+                await update.message.reply_text("❌ ТОЛЬКО: 1m, 3m, 5m")
                 return
         else:
-            value = float(update.message.text)
+            value = float(update.message.text.replace(",", "."))
             if key in ["candles", "time"]:
                 value = int(value)
         settings[mode][key] = value
         del waiting_for[chat_id]
         save_settings()
-        await update.message.reply_text("SAVED")
+        
+        # Возвращаем меню настроек после сохранения
+        menu_map = {
+            "pump": pump_menu,
+            "dump": dump_menu,
+            "vol": vol_menu
+        }
+        menu_text = {
+            "pump": "🔧 PUMP НАСТРОЙКИ",
+            "dump": "🔧 DUMP НАСТРОЙКИ",
+            "vol": "🔧 VOLUME НАСТРОЙКИ"
+        }
+        await update.message.reply_text(
+            f"✅ СОХРАНЕНО: {key.upper()} = {value}\n\n{menu_text[mode]}",
+            reply_markup=menu_map[mode]()
+        )
     except Exception as e:
         print(f"Text handler error: {e}")
-        await update.message.reply_text("ERROR")
+        await update.message.reply_text("❌ ОШИБКА ВВОДА")
 
 async def post_init(app):
     async with aiohttp.ClientSession() as session:
@@ -769,9 +792,4 @@ async def post_init(app):
     asyncio.create_task(scanner(app))
 
 app = Application.builder().token(TOKEN).post_init(post_init).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-
-print("🚀 BOT STARTED")
-app.run_polling()
+app.add_handler(Command
