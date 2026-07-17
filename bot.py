@@ -1,9 +1,12 @@
 ﻿# -*- coding: utf-8 -*-
 import asyncio
+import json
 import time
-import requests
 import random
 import math
+from datetime import datetime
+import aiohttp
+import websockets
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
@@ -16,94 +19,214 @@ except:
     BASE = "https://fapi.binance.com"
     PROXY_LIST = []
 
-session = requests.Session()
-
-def rotate_proxy():
-    if PROXY_LIST:
-        proxy = random.choice(PROXY_LIST)
-        session.proxies.update({"http": proxy, "https": proxy})
-        print(f"PROXY: {proxy}")
-        return True
-    return False
-
-if PROXY_LIST:
-    rotate_proxy()
-
-def safe_request(url, params=None, retries=3):
-    for attempt in range(retries):
-        try:
-            r = session.get(url, params=params, timeout=10)
-            if r.status_code in [403, 429]:
-                print(f"Status {r.status_code}. Rotating proxy.")
-                rotate_proxy()
-                continue
-            return r.json()
-        except Exception as e:
-            print(f"Request error: {e}. Rotating proxy.")
-            rotate_proxy()
-            time.sleep(1)
-    return None
-
 settings = {
-    "pump": {"price": 1.0, "time": 5, "volume": 3.0, "oi": 0.5, "active": False},
-    "dump": {"pump_before": 10.0, "time": 20, "rsi": 80.0, "active": False},
-    "vol": {"tf": "3m", "candles": 10, "max_old_volume": 700000, "min_new_volume": 2000000, "active": False}
+    "pump": {
+        "price": 1.0,
+        "time": 5,
+        "volume": 2000000,
+        "oi": 5.0,
+        "active": False
+    },
+    "dump": {
+        "price": 10.0,
+        "time": 20,
+        "active": False
+    },
+    "vol": {
+        "tf": "3m",
+        "candles": 10,
+        "max_old_volume": 700000,
+        "min_new_volume": 2000000,
+        "active": False
+    }
 }
 
 waiting_for = {}
 scanner_running = True
+orderbook_cache = {}
+symbols_cache = {"data": [], "time": 0}
+data_cache = {"oi": {}, "funding": {}, "klines": {}, "ticker": {}}
+rsi_cache = {}
+ws_cache = {}
+liquidation_cache = {}
+dead_proxies = set()
+CACHE_TTL = 30
+CACHE_TTL_OB = 5
+last_signal_ts = {}
 
-def get_symbols():
-    data = safe_request(BASE + "/fapi/v1/ticker/24hr")
-    if not data:
-        return []
-    coins = [x["symbol"] for x in data if x["symbol"].endswith("USDT")]
-    print(f"Loaded coins: {len(coins)}")
-    return coins
+def get_candle_key(symbol, mode, interval):
+    return f"{symbol}_{mode}_{interval}"
 
-def get_klines(symbol, interval, limit):
-    return safe_request(BASE + "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}) or []
+def get_candle_ts(klines):
+    if klines and len(klines) > 0:
+        return int(klines[-1][0])
+    return 0
 
-def get_orderbook(symbol):
-    data = safe_request(BASE + "/fapi/v1/depth", {"symbol": symbol, "limit": 20})
-    if not data:
+def should_send_signal(symbol, mode, interval, klines):
+    key = get_candle_key(symbol, mode, interval)
+    ts = get_candle_ts(klines)
+    if key in last_signal_ts:
+        if last_signal_ts[key] == ts:
+            return False
+    last_signal_ts[key] = ts
+    return True
+
+def load_settings():
+    global settings
+    try:
+        with open("settings.json", "r") as f:
+            loaded = json.load(f)
+            for mode in settings:
+                if mode in loaded:
+                    for key in loaded[mode]:
+                        if key in settings[mode]:
+                            settings[mode][key] = loaded[mode][key]
+        print("✅ Settings loaded")
+    except:
+        print("No saved settings")
+
+def save_settings():
+    try:
+        with open("settings.json", "w") as f:
+            json.dump(settings, f, indent=4)
+    except:
+        print("Failed to save settings")
+
+load_settings()
+
+def rotate_proxy():
+    if not PROXY_LIST:
         return None
-    bids = [[float(x[0]), float(x[1])] for x in data.get("bids", [])[:20]]
-    asks = [[float(x[0]), float(x[1])] for x in data.get("asks", [])[:20]]
-    spread = (asks[0][0] - bids[0][0]) / bids[0][0] * 100 if bids and asks else 0
-    return {"spread": round(spread, 3), "bids": bids, "asks": asks}
+    available = [p for p in PROXY_LIST if p not in dead_proxies]
+    if not available:
+        print("All proxies dead")
+        return None
+    proxy = random.choice(available)
+    print(f"PROXY: {proxy}")
+    return proxy
 
-def get_funding_rate(symbol):
-    data = safe_request(BASE + "/fapi/v1/premiumIndex", {"symbol": symbol})
-    return float(data.get("lastFundingRate", 0)) * 100 if data else 0
+async def safe_request(session, url, params=None, retries=3):
+    proxy = rotate_proxy()
+    for attempt in range(retries):
+        try:
+            async with session.get(url, params=params, timeout=10, proxy=proxy) as response:
+                if response.status in [403, 429]:
+                    print(f"Status {response.status}. Rotating proxy.")
+                    if proxy:
+                        dead_proxies.add(proxy)
+                    await asyncio.sleep(1)
+                    continue
+                return await response.json()
+        except Exception as e:
+            print(f"Request error: {e}. Rotating proxy.")
+            if proxy:
+                dead_proxies.add(proxy)
+            await asyncio.sleep(1)
+    return None
 
-def get_open_interest(symbol):
-    data = safe_request(BASE + "/fapi/v1/openInterest", {"symbol": symbol})
+async def get_symbols(session):
+    now = time.time()
+    if symbols_cache["data"] and now - symbols_cache["time"] < 1800:
+        return symbols_cache["data"]
+    data = await safe_request(session, BASE + "/fapi/v1/ticker/24hr")
     if not data:
-        return {"current": 0, "change_1h": 0}
-    oi_current = float(data.get("openInterest", 0))
-    hist = safe_request(BASE + "/fapi/v1/openInterestHist", {"symbol": symbol, "period": "1h", "limit": 2})
-    if hist and len(hist) >= 2:
-        oi_old = float(hist[-2]["sumOpenInterest"])
-        oi_change = ((oi_current - oi_old) / oi_old) * 100 if oi_old else 0
+        return symbols_cache["data"] or []
+    coins = [x for x in data if x["symbol"].endswith("USDT")]
+    coins.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+    top_coins = [x["symbol"] for x in coins[:150]]
+    symbols_cache["data"] = top_coins
+    symbols_cache["time"] = now
+    print(f"Loaded top {len(top_coins)} coins")
+    return top_coins
+
+async def get_klines(session, symbol, interval, limit):
+    key = f"{symbol}_{interval}_{limit}"
+    now = time.time()
+    if key in data_cache["klines"] and now - data_cache["klines"][key]["time"] < 60:
+        return data_cache["klines"][key]["data"]
+    data = await safe_request(session, BASE + "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}) or []
+    data_cache["klines"][key] = {"data": data, "time": now}
+    return data
+
+async def get_funding_rate(session, symbol):
+    now = time.time()
+    if symbol in data_cache["funding"] and now - data_cache["funding"][symbol]["time"] < CACHE_TTL:
+        return data_cache["funding"][symbol]["data"]
+    data = await safe_request(session, BASE + "/fapi/v1/premiumIndex", {"symbol": symbol})
+    result = float(data.get("lastFundingRate", 0)) * 100 if data else None
+    data_cache["funding"][symbol] = {"data": result, "time": now}
+    return result
+
+async def get_open_interest(session, symbol, interval_minutes=5):
+    now = time.time()
+    cache_key = f"{symbol}_{interval_minutes}"
+    if cache_key in data_cache["oi"] and now - data_cache["oi"][cache_key]["time"] < CACHE_TTL:
+        return data_cache["oi"][cache_key]["data"]
+    
+    data = await safe_request(session, BASE + "/fapi/v1/openInterest", {"symbol": symbol})
+    if not data:
+        result = None
     else:
-        oi_change = 0
-    return {"current": round(oi_current, 2), "change_1h": round(oi_change, 2)}
+        oi_current = float(data.get("openInterest", 0))
+        
+        period_map = {
+            5: "5m",
+            15: "15m",
+            30: "30m",
+            60: "1h"
+        }
+        period = period_map.get(interval_minutes, "5m")
+        
+        hist = await safe_request(
+            session,
+            BASE + "/futures/data/openInterestHist",
+            {
+                "symbol": symbol,
+                "period": period,
+                "limit": 2
+            }
+        )
+        if hist and len(hist) >= 2:
+            oi_old = float(hist[-2]["sumOpenInterest"])
+            oi_change = ((oi_current - oi_old) / oi_old) * 100 if oi_old else 0
+        else:
+            oi_change = 0
+        
+        ticker = await get_ticker(session, symbol)
+        price = ticker["price"] if ticker else 0
+        oi_usdt = oi_current * price
+        result = {"current": round(oi_usdt, 2), "change": round(oi_change, 2)}
+    
+    data_cache["oi"][cache_key] = {"data": result, "time": now}
+    return result
 
-def get_price_change(symbol, lookback=5):
-    klines = get_klines(symbol, "1m", lookback + 1)
-    if len(klines) < 2:
-        return 0
-    old = float(klines[0][4])
-    new = float(klines[-1][4])
-    return ((new - old) / old) * 100
+async def get_spot_price(session, symbol):
+    data = await safe_request(
+        session,
+        "https://api.binance.com/api/v3/ticker/price",
+        {"symbol": symbol}
+    )
+    return float(data["price"]) if data else 0
 
-def calculate_rsi(symbol, period=14):
-    klines = get_klines(symbol, "5m", period + 1)
+async def get_ticker(session, symbol):
+    now = time.time()
+    if symbol in data_cache["ticker"] and now - data_cache["ticker"][symbol]["time"] < CACHE_TTL:
+        return data_cache["ticker"][symbol]["data"]
+    data = await safe_request(session, BASE + "/fapi/v1/ticker/24hr", {"symbol": symbol})
+    if data:
+        result = {
+            "price": float(data.get("lastPrice", 0)),
+            "volume": float(data.get("quoteVolume", 0))
+        }
+        data_cache["ticker"][symbol] = {"data": result, "time": now}
+        return result
+    return None
+
+def calculate_rsi_from_klines(klines, period=14):
     if len(klines) < period + 1:
         return 50
     gains, losses = 0, 0
-    for i in range(1, len(klines)):
+    for i in range(1, period + 1):
         change = float(klines[i][4]) - float(klines[i-1][4])
         if change > 0:
             gains += change
@@ -114,121 +237,415 @@ def calculate_rsi(symbol, period=14):
     rs = gains / losses
     return round(100 - (100 / (1 + rs)), 2)
 
-# ========== ВСЕ ФУНКЦИИ ПРОВЕРКИ С УЧЁТОМ USDT ==========
+async def get_rsi(session, symbol, interval, period=14):
+    key = f"{symbol}_{interval}_{period}"
+    if key in rsi_cache and time.time() - rsi_cache[key]["time"] < 60:
+        return rsi_cache[key]["data"]
+    klines = await get_klines(session, symbol, interval, period + 1)
+    rsi = calculate_rsi_from_klines(klines, period)
+    rsi_cache[key] = {"data": rsi, "time": time.time()}
+    return rsi
 
-def check_volume(symbol):
-    try:
-        s = settings["vol"]
-        candles = get_klines(symbol, s["tf"], s["candles"] + 1)
-        if len(candles) < s["candles"] + 1:
-            return None
-        
-        # Получаем объёмы в USDT
-        old_volumes = []
-        for c in candles[:-1]:
-            close_price = float(c[4])
-            vol_coin = float(c[5])
-            vol_usdt = close_price * vol_coin
-            old_volumes.append(vol_usdt)
-        
-        avg_old = sum(old_volumes) / len(old_volumes)
-        
-        # Текущая свеча
-        close_price_new = float(candles[-1][4])
-        vol_coin_new = float(candles[-1][5])
-        new_volume = close_price_new * vol_coin_new
-        
-        if avg_old <= s["max_old_volume"] and new_volume >= s["min_new_volume"]:
-            return {
-                "symbol": symbol,
-                "tf": s["tf"],
-                "old": round(avg_old),
-                "new": round(new_volume),
-                "ratio": round(new_volume / avg_old, 2) if avg_old > 0 else 0
-            }
-        return None
-    except:
+async def websocket_global():
+    url = "wss://fstream.binance.com/ws/!bookTicker@arr"
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                print("✅ Global WebSocket connected")
+                async for msg in ws:
+                    data = json.loads(msg)
+                    if isinstance(data, list):
+                        for item in data:
+                            symbol = item.get("s")
+                            if symbol and symbol in symbols_cache["data"]:
+                                ws_cache[symbol] = {
+                                    "time": time.time(),
+                                    "bid": float(item.get("b", 0)),
+                                    "ask": float(item.get("a", 0)),
+                                    "bid_qty": float(item.get("B", 0)),
+                                    "ask_qty": float(item.get("A", 0))
+                                }
+        except Exception as e:
+            print(f"❌ Global WS error: {e}")
+            await asyncio.sleep(5)
+
+async def websocket_liquidations():
+    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                print("✅ Liquidation WS connected")
+
+                async for msg in ws:
+                    data = json.loads(msg)
+
+                    # Универсальная распаковка — работает с любым форматом
+                    payload = data.get("data", data)
+
+                    if "o" not in payload:
+                        continue
+
+                    order = payload["o"]
+
+                    symbol = order["s"]
+                    side = order["S"]
+                    price = float(order["ap"])
+                    qty = float(order["q"])
+
+                    usdt = price * qty
+
+                    if symbol not in liquidation_cache:
+                        liquidation_cache[symbol] = []
+
+                    liquidation_cache[symbol].append({
+                        "time": time.time(),
+                        "side": side,
+                        "usdt": usdt
+                    })
+
+                    liquidation_cache[symbol] = [
+                        x for x in liquidation_cache[symbol]
+                        if time.time() - x["time"] < 1200
+                    ]
+
+        except Exception as e:
+            print("Liquidation WS:", e)
+            await asyncio.sleep(5)
+
+def get_liquidations(symbol):
+    if symbol not in liquidation_cache:
+        return 0, 0
+
+    long_liq = 0
+    short_liq = 0
+
+    for x in liquidation_cache[symbol]:
+        if x["side"] == "SELL":
+            long_liq += x["usdt"]
+        elif x["side"] == "BUY":
+            short_liq += x["usdt"]
+
+    return round(long_liq, 2), round(short_liq, 2)
+
+def analyze_ws_data(symbol):
+    entry = ws_cache.get(symbol)
+    if not entry:
         return None
 
-def check_pump(symbol):
+    bid = entry["bid"]
+    ask = entry["ask"]
+
+    bid_vol = bid * entry["bid_qty"]
+    ask_vol = ask * entry["ask_qty"]
+    delta = bid_vol - ask_vol
+
+    total = bid_vol + ask_vol
+
+    if total == 0:
+        imbalance = 50
+    else:
+        imbalance = bid_vol / total * 100
+
+    ratio = bid_vol / max(ask_vol, 1)
+
+    return {
+        "bid": bid,
+        "ask": ask,
+        "spread": round((ask - bid) / bid * 100, 4),
+        "bid_vol": round(bid_vol, 2),
+        "ask_vol": round(ask_vol, 2),
+        "imbalance": round(imbalance, 1),
+        "ratio": round(ratio, 2),
+        "delta": round(delta, 2)
+    }
+
+async def analyze_orderbook(session, symbol):
     try:
-        s = settings["pump"]
-        klines = get_klines(symbol, "1m", s["time"] + 1)
-        if len(klines) < 2:
+        if symbol in orderbook_cache and time.time() - orderbook_cache[symbol]["time"] < CACHE_TTL_OB:
+            return orderbook_cache[symbol]["data"]
+        data = await safe_request(session, BASE + "/fapi/v1/depth", {"symbol": symbol, "limit": 50})
+        if not data or "bids" not in data or "asks" not in data:
             return None
-        
-        # Изменение цены
-        price_old = float(klines[0][4])
-        price_new = float(klines[-1][4])
-        price_change = ((price_new - price_old) / price_old) * 100
-        
-        if price_change < s["price"]:
+        bids = [[float(x[0]), float(x[1])] for x in data.get("bids", [])[:50]]
+        asks = [[float(x[0]), float(x[1])] for x in data.get("asks", [])[:50]]
+        if not bids or not asks:
             return None
+        current_price = bids[0][0]
+        buy_vol = sum([p[0] * p[1] for p in bids])
+        sell_vol = sum([p[0] * p[1] for p in asks])
+        total_vol = buy_vol + sell_vol
+        buy_pct = (buy_vol / total_vol * 100) if total_vol > 0 else 50
+        sell_pct = 100 - buy_pct
+        price_range = (asks[-1][0] - bids[0][0]) / bids[0][0] * 100
+        buy_density = buy_vol / price_range if price_range > 0 else 0
+        sell_density = sell_vol / price_range if price_range > 0 else 0
+        avg_vol = total_vol / len(bids + asks)
+        big_bids = [p for p in bids if p[0] * p[1] > avg_vol * 1.5]
+        big_asks = [p for p in asks if p[0] * p[1] > avg_vol * 1.5]
+        cluster_buy_usdt = sum([p[0] * p[1] for p in big_bids])
+        cluster_sell_usdt = sum([p[0] * p[1] for p in big_asks])
+        large_orders = [p for p in bids + asks if p[0] * p[1] > 50000]
+        support = None
+        resistance = None
+        for bid in sorted(bids, key=lambda x: x[0]*x[1], reverse=True):
+            if abs(bid[0] - current_price) / current_price <= 0.02:
+                support = bid[0]
+                break
+        for ask in sorted(asks, key=lambda x: x[0]*x[1], reverse=True):
+            if abs(ask[0] - current_price) / current_price <= 0.02:
+                resistance = ask[0]
+                break
+        result = {
+            "price": current_price,
+            "buy_vol": round(buy_vol, 2),
+            "sell_vol": round(sell_vol, 2),
+            "buy_pct": round(buy_pct, 2),
+            "sell_pct": round(sell_pct, 2),
+            "buy_density": round(buy_density, 2),
+            "sell_density": round(sell_density, 2),
+            "cluster_buy_usdt": round(cluster_buy_usdt, 2),
+            "cluster_sell_usdt": round(cluster_sell_usdt, 2),
+            "large_orders": len(large_orders),
+            "support": support,
+            "resistance": resistance
+        }
+        orderbook_cache[symbol] = {"time": time.time(), "data": result}
+        return result
+    except Exception as e:
+        print(f"OrderBook error {symbol}: {e}")
+        return None
+
+# ========== ОСНОВНОЙ СКАНЕР ==========
+async def scanner(app):
+    async with aiohttp.ClientSession() as session:
+        while True:
+            if scanner_running:
+                try:
+                    symbols = await get_symbols(session)
+                    print(f"🔄 Scanning {len(symbols)} coins...")
+                    
+                    for symbol in symbols:
+                        s_pump = settings["pump"]
+                        s_dump = settings["dump"]
+                        s_vol = settings["vol"]
+                        
+                        # ===== PUMP =====
+                        if s_pump["active"]:
+                            interval = f"{s_pump['time']}m"
+                            klines = await get_klines(session, symbol, interval, 2)
+                            if len(klines) >= 2:
+                                price_old = float(klines[0][4])
+                                price_new = float(klines[-1][4])
+                                price_change = ((price_new - price_old) / price_old) * 100
+                                new_vol = float(klines[-1][7])
+                                oi = await get_open_interest(session, symbol, s_pump["time"])
+                                
+                                price_ok = price_change >= s_pump["price"]
+                                vol_ok = new_vol >= s_pump["volume"]
+                                oi_ok = oi and oi["change"] >= s_pump["oi"]
+                                
+                                if price_ok and vol_ok and oi_ok:
+                                    if should_send_signal(symbol, "pump", interval, klines):
+                                        await send_full_signal(session, app, symbol, "PUMP", {
+                                            "price_change": price_change,
+                                            "price_ok": price_ok,
+                                            "vol_ok": vol_ok,
+                                            "oi_ok": oi_ok,
+                                            "new_vol": new_vol,
+                                            "oi_change": oi["change"] if oi else 0,
+                                            "klines": klines,
+                                            "oi_data": oi
+                                        })
+                        
+                        # ===== DUMP =====
+                        if s_dump["active"]:
+                            interval = f"{s_dump['time']}m"
+                            klines = await get_klines(session, symbol, interval, 2)
+                            if len(klines) >= 2:
+                                price_old = float(klines[0][4])
+                                price_new = float(klines[-1][4])
+                                price_change = ((price_new - price_old) / price_old) * 100
+                                
+                                if price_change >= s_dump["price"]:
+                                    if should_send_signal(symbol, "dump", interval, klines):
+                                        await send_full_signal(session, app, symbol, "DUMP", {
+                                            "price_change": price_change,
+                                            "klines": klines
+                                        })
+                        
+                        # ===== VOLUME =====
+                        if s_vol["active"]:
+                            klines = await get_klines(session, symbol, s_vol["tf"], s_vol["candles"] + 1)
+                            if len(klines) >= s_vol["candles"] + 1:
+                                all_old_ok = True
+                                old_vols = []
+                                for c in klines[:-1]:
+                                    vol = float(c[7])
+                                    old_vols.append(vol)
+                                    if vol > s_vol["max_old_volume"]:
+                                        all_old_ok = False
+                                new_vol = float(klines[-1][7])
+                                if all_old_ok and new_vol >= s_vol["min_new_volume"]:
+                                    if should_send_signal(symbol, "vol", s_vol["tf"], klines):
+                                        await send_full_signal(session, app, symbol, "VOLUME", {
+                                            "new_vol": new_vol,
+                                            "old_vols": old_vols,
+                                            "klines": klines
+                                        })
+                        
+                        await asyncio.sleep(0.01)
+                except Exception as e:
+                    print(f"SCAN ERROR: {e}")
+            await asyncio.sleep(30)
+
+# ========== ЕДИНОЕ СООБЩЕНИЕ ==========
+async def send_full_signal(session, app, symbol, mode, data):
+    try:
+        ticker = await get_ticker(session, symbol)
+        if not ticker:
+            return
+        futures_price = ticker["price"]
+        spot_price = await get_spot_price(session, symbol)
         
-        # Объём в USDT (средний и текущий)
-        old_volumes = []
-        for c in klines[:-1]:
-            close = float(c[4])
-            vol_coin = float(c[5])
-            vol_usdt = close * vol_coin
-            old_volumes.append(vol_usdt)
+        rsi_1m = await get_rsi(session, symbol, "1m")
+        rsi_5m = await get_rsi(session, symbol, "5m")
+        rsi_15m = await get_rsi(session, symbol, "15m")
+        rsi_1h = await get_rsi(session, symbol, "1h")
         
-        avg_old = sum(old_volumes) / len(old_volumes)
+        funding = await get_funding_rate(session, symbol)
+        long_liq, short_liq = get_liquidations(symbol)
         
-        close_new = float(klines[-1][4])
-        vol_coin_new = float(klines[-1][5])
-        new_vol_usdt = close_new * vol_coin_new
+        ob = await analyze_orderbook(session, symbol)
+        ws = analyze_ws_data(symbol)
         
-        vol_ratio = new_vol_usdt / avg_old if avg_old > 0 else 1
+        emoji = "🚀" if mode == "PUMP" else "🔥" if mode == "DUMP" else "📦"
         
-        if vol_ratio < s["volume"]:
-            return None
+        # ===== ШАПКА С ПРИЧИНОЙ =====
+        msg = f"{emoji} {mode} SIGNAL\n\n📊 {symbol}\n"
+        
+        if mode == "PUMP":
+            price_change = data.get("price_change", 0)
+            new_vol = data.get("new_vol", 0)
+            oi_change = data.get("oi_change", 0)
+            msg += f"""
+✔ Price: +{price_change:.2f}% (≥ {settings['pump']['price']}%)
+✔ Volume: {new_vol:,.0f} USDT (≥ {settings['pump']['volume']:,} USDT)
+✔ OI: +{oi_change:.2f}% (≥ {settings['pump']['oi']}%)
+✔ Time: {settings['pump']['time']} min
+"""
+        elif mode == "DUMP":
+            price_change = data.get("price_change", 0)
+            msg += f"""
+✔ Price Growth: +{price_change:.2f}% (≥ {settings['dump']['price']}%)
+✔ Time: {settings['dump']['time']} min
+"""
+        elif mode == "VOLUME":
+            old_vols = data.get("old_vols", [])
+            new_vol = data.get("new_vol", 0)
+            msg += f"""
+✔ All old candles ≤ {settings['vol']['max_old_volume']:,} USDT
+✔ New candle: {new_vol:,.0f} USDT (≥ {settings['vol']['min_new_volume']:,} USDT)
+✔ TF: {settings['vol']['tf']} | Candles: {settings['vol']['candles']}
+"""
+        
+        msg += "\n" + "-" * 40 + "\n"
+        
+        # ===== ОБЩАЯ АНАЛИТИКА =====
+        msg += f"""
+💲 Spot: ${spot_price:.4f}
+💲 Futures: ${futures_price:.4f}
+
+📈 RSI:
+  1m: {rsi_1m:.1f} | 5m: {rsi_5m:.1f}
+  15m: {rsi_15m:.1f} | 1h: {rsi_1h:.1f}
+"""
         
         # OI
-        oi = get_open_interest(symbol)
-        if abs(oi["change_1h"]) < s["oi"]:
-            return None
+        if mode == "PUMP":
+            oi_data = data.get("oi_data")
+            if oi_data:
+                msg += f"\n📊 OI: {oi_data['current']:,.0f} USDT (Change: {oi_data['change']:.2f}%)"
+            else:
+                msg += "\n📊 OI: N/A"
+        else:
+            oi = await get_open_interest(session, symbol, 5)
+            if oi:
+                msg += f"\n📊 OI: {oi['current']:,.0f} USDT (Change: {oi['change']:.2f}%)"
+            else:
+                msg += "\n📊 OI: N/A"
         
-        return {
-            "symbol": symbol,
-            "price_change": round(price_change, 2),
-            "vol_ratio": round(vol_ratio, 2),
-            "oi_change": oi["change_1h"]
-        }
-    except:
-        return None
+        # Funding
+        msg += f"\n💰 Funding: {funding:.4f}%" if funding is not None else "\n💰 Funding: N/A"
+        
+        # ===== ЛИКВИДАЦИИ =====
+        msg += f"""
+💥 Liquidations (20 min)
+  LONG: {long_liq:,.0f} USDT
+  SHORT: {short_liq:,.0f} USDT
+"""
+        
+        # ===== Order Book =====
+        if ob:
+            buy_density = ob.get("buy_density", 0)
+            sell_density = ob.get("sell_density", 0)
+            cluster_buy = ob.get("cluster_buy_usdt", 0)
+            cluster_sell = ob.get("cluster_sell_usdt", 0)
+            large_orders = ob.get("large_orders", 0)
+            support = ob.get("support")
+            resistance = ob.get("resistance")
+            
+            msg += f"""
+📚 Order Book:
+  Buyers: {ob['buy_pct']:.1f}% | Sellers: {ob['sell_pct']:.1f}%
+  Buy Density: {buy_density:,.0f} USDT
+  Sell Density: {sell_density:,.0f} USDT
+  Buy Clusters: {cluster_buy:,.0f} USDT
+  Sell Clusters: {cluster_sell:,.0f} USDT
+  Large Orders: {large_orders}
+  Support: ${support:.4f}""" if support else """
+  Support: N/A"""
+            msg += f"""
+  Resistance: ${resistance:.4f}""" if resistance else """
+  Resistance: N/A"""
+        
+        # ===== WS БЛОК =====
+        if ws:
+            ratio = ws["ratio"]
 
-def check_dump(symbol):
-    try:
-        s = settings["dump"]
-        klines = get_klines(symbol, "1m", s["time"] + 1)
-        if len(klines) < 2:
-            return None
+            if ratio >= 4:
+                pressure = "EXTREME BUY"
+            elif ratio >= 2.5:
+                pressure = "STRONG BUY"
+            elif ratio >= 1.4:
+                pressure = "BUY"
+            elif ratio <= 0.25:
+                pressure = "EXTREME SELL"
+            elif ratio <= 0.50:
+                pressure = "STRONG SELL"
+            elif ratio <= 0.75:
+                pressure = "SELL"
+            else:
+                pressure = "NEUTRAL"
+
+            msg += f"""
+⚡ Live OrderBook
+
+Spread: {ws['spread']:.4f} %
+
+Bid Volume: {ws['bid_vol']:,.0f} USDT
+Ask Volume: {ws['ask_vol']:,.0f} USDT
+
+Imbalance: {ws['imbalance']:.1f} %
+
+OrderBook Pressure: {pressure}
+"""
         
-        # Изменение цены
-        price_old = float(klines[0][4])
-        price_new = float(klines[-1][4])
-        price_change = ((price_new - price_old) / price_old) * 100
-        
-        if price_change > -s["pump_before"]:
-            return None
-        
-        # RSI
-        rsi = calculate_rsi(symbol)
-        if rsi < s["rsi"]:
-            return None
-        
-        return {
-            "symbol": symbol,
-            "price_change": round(price_change, 2),
-            "rsi": rsi,
-            "time_min": s["time"]
-        }
-    except:
-        return None
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg)
+    except Exception as e:
+        print(f"Send signal error {symbol}: {e}")
 
 # ========== МЕНЮ ==========
-
 def main_menu():
     status = "RUNNING" if scanner_running else "STOPPED"
     return InlineKeyboardMarkup([
@@ -243,7 +660,7 @@ def pump_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("PRICE %", callback_data="pump_price")],
         [InlineKeyboardButton("TIME MIN", callback_data="pump_time")],
-        [InlineKeyboardButton("VOLUME X", callback_data="pump_volume")],
+        [InlineKeyboardButton("VOLUME USDT", callback_data="pump_volume")],
         [InlineKeyboardButton("OI %", callback_data="pump_oi")],
         [InlineKeyboardButton("START", callback_data="pump_start")],
         [InlineKeyboardButton("STOP", callback_data="pump_stop")],
@@ -252,9 +669,8 @@ def pump_menu():
 
 def dump_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("PUMP BEFORE %", callback_data="dump_pump_before")],
+        [InlineKeyboardButton("PRICE %", callback_data="dump_price")],
         [InlineKeyboardButton("TIME MIN", callback_data="dump_time")],
-        [InlineKeyboardButton("RSI", callback_data="dump_rsi")],
         [InlineKeyboardButton("START", callback_data="dump_start")],
         [InlineKeyboardButton("STOP", callback_data="dump_stop")],
         [InlineKeyboardButton("BACK", callback_data="main")]
@@ -272,7 +688,7 @@ def vol_menu():
     ])
 
 def status_text():
-    total = len(get_symbols())
+    total = len(symbols_cache["data"]) if symbols_cache["data"] else 0
     return f"""
 SCREENER STATUS
 ================
@@ -281,28 +697,25 @@ SCANNER: {'RUNNING' if scanner_running else 'STOPPED'}
 PUMP
   Price: {settings['pump']['price']}%
   Time: {settings['pump']['time']} min
-  Volume: {settings['pump']['volume']}x
+  Volume: {settings['pump']['volume']:,} USDT
   OI: {settings['pump']['oi']}%
   Active: {settings['pump']['active']}
 
-DUMP
-  Drop: {settings['dump']['pump_before']}%
+DUMP (SHORT сигналы)
+  Price: {settings['dump']['price']}%
   Time: {settings['dump']['time']} min
-  RSI: {settings['dump']['rsi']}
   Active: {settings['dump']['active']}
 
 VOLUME
   TF: {settings['vol']['tf']}
   Candles: {settings['vol']['candles']}
-  Max Vol: {settings['vol']['max_old_volume']}
-  Min Vol: {settings['vol']['min_new_volume']}
+  Max Vol: {settings['vol']['max_old_volume']:,}
+  Min Vol: {settings['vol']['min_new_volume']:,}
   Active: {settings['vol']['active']}
 
 COINS: {total}
 INTERVAL: 30 sec
 """
-
-# ========== ОБРАБОТЧИКИ ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("SCREENER MENU", reply_markup=main_menu())
@@ -312,7 +725,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
     if data == "main":
         await query.edit_message_text("SCREENER MENU", reply_markup=main_menu())
     elif data == "toggle_scanner":
@@ -329,10 +741,12 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.endswith("_start"):
         mode = data.split("_")[0]
         settings[mode]["active"] = True
+        save_settings()
         await query.edit_message_text(f"{mode.upper()} STARTED", reply_markup=main_menu())
     elif data.endswith("_stop"):
         mode = data.split("_")[0]
         settings[mode]["active"] = False
+        save_settings()
         await query.edit_message_text(f"{mode.upper()} STOPPED", reply_markup=main_menu())
     elif "_" in data:
         mode, key = data.split("_", 1)
@@ -356,76 +770,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 value = int(value)
         settings[mode][key] = value
         del waiting_for[chat_id]
+        save_settings()
         await update.message.reply_text("SAVED")
-    except:
+    except Exception as e:
+        print(f"Text handler error: {e}")
         await update.message.reply_text("ERROR")
 
-# ========== СКАНЕР ==========
-
-async def scanner(app):
-    while True:
-        if scanner_running:
-            try:
-                symbols = get_symbols()
-                print(f"Scanning {len(symbols)} coins...")
-                for symbol in symbols:
-                    if settings["vol"]["active"]:
-                        signal = check_volume(symbol)
-                        if signal:
-                            await app.bot.send_message(
-                                chat_id=CHAT_ID,
-                                text=f"""
-VOLUME SPIKE
-Coin: {signal['symbol']}
-TF: {signal['tf']}
-Old Vol: {signal['old']:,} USDT
-New Vol: {signal['new']:,} USDT
-Growth: {signal['ratio']}x
-"""
-                            )
-                            await asyncio.sleep(1)
-                    if settings["pump"]["active"]:
-                        signal = check_pump(symbol)
-                        if signal:
-                            await app.bot.send_message(
-                                chat_id=CHAT_ID,
-                                text=f"""
-PUMP SIGNAL
-Coin: {signal['symbol']}
-Price: {signal['price_change']}%
-Volume: {signal['vol_ratio']}x
-OI Change: {signal['oi_change']}%
-"""
-                            )
-                            await asyncio.sleep(1)
-                    if settings["dump"]["active"]:
-                        signal = check_dump(symbol)
-                        if signal:
-                            await app.bot.send_message(
-                                chat_id=CHAT_ID,
-                                text=f"""
-DUMP SIGNAL
-Coin: {signal['symbol']}
-Drop: {signal['price_change']}%
-RSI: {signal['rsi']}
-Time: {signal['time_min']} min
-"""
-                            )
-                            await asyncio.sleep(1)
-                    await asyncio.sleep(0.05)
-            except Exception as e:
-                print("SCAN ERROR", e)
-        await asyncio.sleep(30)
-
 async def post_init(app):
+    async with aiohttp.ClientSession() as session:
+        symbols = await get_symbols(session)
+    asyncio.create_task(websocket_global())
+    asyncio.create_task(websocket_liquidations())
     asyncio.create_task(scanner(app))
-
-# ========== ЗАПУСК ==========
 
 app = Application.builder().token(TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-print("BOT STARTED (ALL VOLUMES IN USDT)")
+print("🚀 BOT STARTED")
 app.run_polling()
