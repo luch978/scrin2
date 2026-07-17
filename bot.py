@@ -19,6 +19,7 @@ except:
     BASE = "https://fapi.binance.com"
     PROXY_LIST = []
 
+# ========== НАСТРОЙКИ ==========
 settings = {
     "pump": {
         "price": 1.0,
@@ -52,24 +53,7 @@ liquidation_cache = {}
 dead_proxies = set()
 CACHE_TTL = 30
 CACHE_TTL_OB = 5
-last_signal_ts = {}
-
-def get_candle_key(symbol, mode, interval):
-    return f"{symbol}_{mode}_{interval}"
-
-def get_candle_ts(klines):
-    if klines and len(klines) > 0:
-        return int(klines[-1][0])
-    return 0
-
-def should_send_signal(symbol, mode, interval, klines):
-    key = get_candle_key(symbol, mode, interval)
-    ts = get_candle_ts(klines)
-    if key in last_signal_ts:
-        if last_signal_ts[key] == ts:
-            return False
-    last_signal_ts[key] = ts
-    return True
+last_signal_time = {}
 
 def load_settings():
     global settings
@@ -279,8 +263,6 @@ async def websocket_liquidations():
 
                 async for msg in ws:
                     data = json.loads(msg)
-
-                    # Универсальная распаковка — работает с любым форматом
                     payload = data.get("data", data)
 
                     if "o" not in payload:
@@ -416,6 +398,15 @@ async def analyze_orderbook(session, symbol):
         print(f"OrderBook error {symbol}: {e}")
         return None
 
+def can_send_signal(symbol, mode):
+    key = f"{symbol}_{mode}"
+    now = time.time()
+    if key in last_signal_time:
+        if now - last_signal_time[key] < 60:
+            return False
+    last_signal_time[key] = now
+    return True
+
 # ========== ОСНОВНОЙ СКАНЕР ==========
 async def scanner(app):
     async with aiohttp.ClientSession() as session:
@@ -446,7 +437,7 @@ async def scanner(app):
                                 oi_ok = oi and oi["change"] >= s_pump["oi"]
                                 
                                 if price_ok and vol_ok and oi_ok:
-                                    if should_send_signal(symbol, "pump", interval, klines):
+                                    if can_send_signal(symbol, "pump"):
                                         await send_full_signal(session, app, symbol, "PUMP", {
                                             "price_change": price_change,
                                             "price_ok": price_ok,
@@ -468,7 +459,7 @@ async def scanner(app):
                                 price_change = ((price_new - price_old) / price_old) * 100
                                 
                                 if price_change >= s_dump["price"]:
-                                    if should_send_signal(symbol, "dump", interval, klines):
+                                    if can_send_signal(symbol, "dump"):
                                         await send_full_signal(session, app, symbol, "DUMP", {
                                             "price_change": price_change,
                                             "klines": klines
@@ -487,7 +478,7 @@ async def scanner(app):
                                         all_old_ok = False
                                 new_vol = float(klines[-1][7])
                                 if all_old_ok and new_vol >= s_vol["min_new_volume"]:
-                                    if should_send_signal(symbol, "vol", s_vol["tf"], klines):
+                                    if can_send_signal(symbol, "vol"):
                                         await send_full_signal(session, app, symbol, "VOLUME", {
                                             "new_vol": new_vol,
                                             "old_vols": old_vols,
@@ -499,7 +490,7 @@ async def scanner(app):
                     print(f"SCAN ERROR: {e}")
             await asyncio.sleep(30)
 
-# ========== ЕДИНОЕ СООБЩЕНИЕ ==========
+# ========== ОТПРАВКА СИГНАЛА ==========
 async def send_full_signal(session, app, symbol, mode, data):
     try:
         ticker = await get_ticker(session, symbol)
@@ -521,7 +512,6 @@ async def send_full_signal(session, app, symbol, mode, data):
         
         emoji = "🚀" if mode == "PUMP" else "🔥" if mode == "DUMP" else "📦"
         
-        # ===== ШАПКА С ПРИЧИНОЙ =====
         msg = f"{emoji} {mode} SIGNAL\n\n📊 {symbol}\n"
         
         if mode == "PUMP":
@@ -551,7 +541,6 @@ async def send_full_signal(session, app, symbol, mode, data):
         
         msg += "\n" + "-" * 40 + "\n"
         
-        # ===== ОБЩАЯ АНАЛИТИКА =====
         msg += f"""
 💲 Spot: ${spot_price:.4f}
 💲 Futures: ${futures_price:.4f}
@@ -561,7 +550,6 @@ async def send_full_signal(session, app, symbol, mode, data):
   15m: {rsi_15m:.1f} | 1h: {rsi_1h:.1f}
 """
         
-        # OI
         if mode == "PUMP":
             oi_data = data.get("oi_data")
             if oi_data:
@@ -575,17 +563,14 @@ async def send_full_signal(session, app, symbol, mode, data):
             else:
                 msg += "\n📊 OI: N/A"
         
-        # Funding
         msg += f"\n💰 Funding: {funding:.4f}%" if funding is not None else "\n💰 Funding: N/A"
         
-        # ===== ЛИКВИДАЦИИ =====
         msg += f"""
 💥 Liquidations (20 min)
   LONG: {long_liq:,.0f} USDT
   SHORT: {short_liq:,.0f} USDT
 """
         
-        # ===== Order Book =====
         if ob:
             buy_density = ob.get("buy_density", 0)
             sell_density = ob.get("sell_density", 0)
@@ -609,7 +594,6 @@ async def send_full_signal(session, app, symbol, mode, data):
   Resistance: ${resistance:.4f}""" if resistance else """
   Resistance: N/A"""
         
-        # ===== WS БЛОК =====
         if ws:
             ratio = ws["ratio"]
 
@@ -650,10 +634,10 @@ def main_menu():
     status = "RUNNING" if scanner_running else "STOPPED"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"SCANNER: {status}", callback_data="toggle_scanner")],
-        [InlineKeyboardButton("STATUS", callback_data="status")],
-        [InlineKeyboardButton("PUMP", callback_data="pump_menu")],
-        [InlineKeyboardButton("DUMP", callback_data="dump_menu")],
-        [InlineKeyboardButton("VOL", callback_data="vol_menu")]
+        [InlineKeyboardButton("📊 STATUS", callback_data="status")],
+        [InlineKeyboardButton("🔧 PUMP", callback_data="pump_menu")],
+        [InlineKeyboardButton("🔧 DUMP", callback_data="dump_menu")],
+        [InlineKeyboardButton("🔧 VOL", callback_data="vol_menu")]
     ])
 
 def pump_menu():
@@ -664,7 +648,7 @@ def pump_menu():
         [InlineKeyboardButton("OI %", callback_data="pump_oi")],
         [InlineKeyboardButton("START", callback_data="pump_start")],
         [InlineKeyboardButton("STOP", callback_data="pump_stop")],
-        [InlineKeyboardButton("BACK", callback_data="main")]
+        [InlineKeyboardButton("📊 BACK", callback_data="main")]
     ])
 
 def dump_menu():
@@ -673,7 +657,7 @@ def dump_menu():
         [InlineKeyboardButton("TIME MIN", callback_data="dump_time")],
         [InlineKeyboardButton("START", callback_data="dump_start")],
         [InlineKeyboardButton("STOP", callback_data="dump_stop")],
-        [InlineKeyboardButton("BACK", callback_data="main")]
+        [InlineKeyboardButton("📊 BACK", callback_data="main")]
     ])
 
 def vol_menu():
@@ -684,7 +668,7 @@ def vol_menu():
         [InlineKeyboardButton("MIN NEW VOL", callback_data="vol_min_new_volume")],
         [InlineKeyboardButton("START", callback_data="vol_start")],
         [InlineKeyboardButton("STOP", callback_data="vol_stop")],
-        [InlineKeyboardButton("BACK", callback_data="main")]
+        [InlineKeyboardButton("📊 BACK", callback_data="main")]
     ])
 
 def status_text():
@@ -725,6 +709,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    
     if data == "main":
         await query.edit_message_text("SCREENER MENU", reply_markup=main_menu())
     elif data == "toggle_scanner":
