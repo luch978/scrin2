@@ -100,7 +100,9 @@ async def safe_request(session, url, params=None, retries=3):
                     await asyncio.sleep(1)
                     continue
                 if response.status != 200:
-                    print(f"⚠️ Status {response.status} for {url}")
+                    # Показываем причину ошибки
+                    text = await response.text()
+                    print(f"⚠️ Status {response.status} for {url} - {text[:200]}")
                     return None
                 return await response.json()
         except Exception as e:
@@ -132,7 +134,19 @@ async def get_klines(session, symbol, interval, limit):
     now = time.time()
     if key in data_cache["klines"] and now - data_cache["klines"][key]["time"] < 60:
         return data_cache["klines"][key]["data"]
-    data = await safe_request(session, BASE + "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit}) or []
+    
+    # Исправленный запрос - явно указываем параметры
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+    data = await safe_request(session, BASE + "/fapi/v1/klines", params)
+    
+    if not data:
+        print(f"⚠️ No klines data for {symbol} {interval} {limit}")
+        data = []
+    
     data_cache["klines"][key] = {"data": data, "time": now}
     return data
 
@@ -443,7 +457,6 @@ async def scanner(app):
                                 vol_ok = new_vol >= s_pump["volume"]
                                 oi_ok = oi and oi["change"] >= s_pump["oi"]
                                 
-                                # Логирование для отладки
                                 if price_ok and vol_ok and oi_ok:
                                     print(f"✅ PUMP conditions met for {symbol}!")
                                     if can_send_signal(symbol, "pump"):
@@ -457,9 +470,6 @@ async def scanner(app):
                                             "klines": klines,
                                             "oi_data": oi
                                         })
-                                # else:
-                                #     if scan_count % 5 == 0:  # Логируем каждый 5-й проход для экономии
-                                #         print(f"🔍 {symbol} PUMP: price={price_change:.2f}% (need {s_pump['price']}%), vol={new_vol:,.0f} (need {s_pump['volume']:,}), oi={oi['change'] if oi else 0:.2f}% (need {s_pump['oi']}%)")
                         
                         # DUMP
                         if s_dump["active"]:
