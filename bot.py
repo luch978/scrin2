@@ -23,14 +23,14 @@ except:
 settings = {
     "pump": {
         "price": 1.0,
-        "time": 5,
+        "time": 5,          # КОЛИЧЕСТВО МИНУТ
         "volume": 2000000,
         "oi": 5.0,
         "active": False
     },
     "dump": {
         "price": 10.0,
-        "time": 20,
+        "time": 20,         # КОЛИЧЕСТВО МИНУТ
         "active": False
     },
     "vol": {
@@ -100,7 +100,6 @@ async def safe_request(session, url, params=None, retries=3):
                     await asyncio.sleep(1)
                     continue
                 if response.status != 200:
-                    # Показываем причину ошибки
                     text = await response.text()
                     print(f"⚠️ Status {response.status} for {url} - {text[:200]}")
                     return None
@@ -135,7 +134,6 @@ async def get_klines(session, symbol, interval, limit):
     if key in data_cache["klines"] and now - data_cache["klines"][key]["time"] < 60:
         return data_cache["klines"][key]["data"]
     
-    # Исправленный запрос - явно указываем параметры
     params = {
         "symbol": symbol,
         "interval": interval,
@@ -442,15 +440,22 @@ async def scanner(app):
                         s_dump = settings["dump"]
                         s_vol = settings["vol"]
                         
-                        # PUMP
+                        # ===== PUMP =====
                         if s_pump["active"]:
-                            interval = f"{s_pump['time']}m"
-                            klines = await get_klines(session, symbol, interval, 2)
-                            if len(klines) >= 2:
+                            # Берем минутные свечи за указанное количество минут
+                            # Например: time=10 => берем 11 свечей по 1m
+                            klines = await get_klines(session, symbol, "1m", s_pump["time"] + 1)
+                            
+                            if len(klines) >= s_pump["time"] + 1:
+                                # Цена в начале периода (первая свеча)
                                 price_old = float(klines[0][4])
+                                # Цена сейчас (последняя свеча)
                                 price_new = float(klines[-1][4])
                                 price_change = ((price_new - price_old) / price_old) * 100
+                                
+                                # Объем последней свечи
                                 new_vol = float(klines[-1][7])
+                                
                                 oi = await get_open_interest(session, symbol, s_pump["time"])
                                 
                                 price_ok = price_change >= s_pump["price"]
@@ -468,14 +473,16 @@ async def scanner(app):
                                             "new_vol": new_vol,
                                             "oi_change": oi["change"] if oi else 0,
                                             "klines": klines,
-                                            "oi_data": oi
+                                            "oi_data": oi,
+                                            "time_minutes": s_pump["time"]  # Добавляем для отображения
                                         })
                         
-                        # DUMP
+                        # ===== DUMP =====
                         if s_dump["active"]:
-                            interval = f"{s_dump['time']}m"
-                            klines = await get_klines(session, symbol, interval, 2)
-                            if len(klines) >= 2:
+                            # Берем минутные свечи за указанное количество минут
+                            klines = await get_klines(session, symbol, "1m", s_dump["time"] + 1)
+                            
+                            if len(klines) >= s_dump["time"] + 1:
                                 price_old = float(klines[0][4])
                                 price_new = float(klines[-1][4])
                                 price_change = ((price_new - price_old) / price_old) * 100
@@ -485,10 +492,11 @@ async def scanner(app):
                                     if can_send_signal(symbol, "dump"):
                                         await send_full_signal(session, app, symbol, "DUMP", {
                                             "price_change": price_change,
-                                            "klines": klines
+                                            "klines": klines,
+                                            "time_minutes": s_dump["time"]  # Добавляем для отображения
                                         })
                         
-                        # VOLUME
+                        # ===== VOLUME =====
                         if s_vol["active"]:
                             klines = await get_klines(session, symbol, s_vol["tf"], s_vol["candles"] + 1)
                             if len(klines) >= s_vol["candles"] + 1:
@@ -545,17 +553,19 @@ async def send_full_signal(session, app, symbol, mode, data):
             price_change = data.get("price_change", 0)
             new_vol = data.get("new_vol", 0)
             oi_change = data.get("oi_change", 0)
+            time_minutes = data.get("time_minutes", settings['pump']['time'])
             msg += f"""
 ✔ Price: +{price_change:.2f}% (≥ {settings['pump']['price']}%)
 ✔ Volume: {new_vol:,.0f} USDT (≥ {settings['pump']['volume']:,} USDT)
 ✔ OI: +{oi_change:.2f}% (≥ {settings['pump']['oi']}%)
-✔ Time: {settings['pump']['time']} min
+✔ Period: {time_minutes} min (1m candles)
 """
         elif mode == "DUMP":
             price_change = data.get("price_change", 0)
+            time_minutes = data.get("time_minutes", settings['dump']['time'])
             msg += f"""
 ✔ Price Growth: +{price_change:.2f}% (≥ {settings['dump']['price']}%)
-✔ Time: {settings['dump']['time']} min
+✔ Period: {time_minutes} min (1m candles)
 """
         elif mode == "VOLUME":
             old_vols = data.get("old_vols", [])
