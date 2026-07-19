@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 import asyncio
 import json
 import time
@@ -81,15 +81,12 @@ load_settings()
 def rotate_proxy():
     if not PROXY_LIST:
         return None
-    # Просто берем случайный прокси из списка
-    # НИКАКИХ dead_proxies - прокси ВСЕГДА РАБОТАЮТ
     proxy = random.choice(PROXY_LIST)
     print(f"🔑 Using proxy: {proxy[:40]}...")
     return proxy
 
 async def safe_request(session, url, params=None, retries=3):
     for attempt in range(retries):
-        # НОВЫЙ ПРОКСИ НА КАЖДУЮ ПОПЫТКУ!
         proxy = rotate_proxy()
         
         try:
@@ -788,4 +785,52 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    if chat_id not in waiting
+    if chat_id not in waiting_for:
+        return
+    mode, key = waiting_for[chat_id]
+    try:
+        if key == "tf":
+            value = update.message.text.strip()
+            if value not in ["1m", "3m", "5m"]:
+                await update.message.reply_text("❌ ТОЛЬКО: 1m, 3m, 5m")
+                return
+        else:
+            value = float(update.message.text.replace(",", "."))
+            if key in ["candles", "time"]:
+                value = int(value)
+        settings[mode][key] = value
+        del waiting_for[chat_id]
+        save_settings()
+        
+        menu_map = {
+            "pump": pump_menu,
+            "dump": dump_menu,
+            "vol": vol_menu
+        }
+        menu_text = {
+            "pump": "🔧 PUMP НАСТРОЙКИ",
+            "dump": "🔧 DUMP НАСТРОЙКИ",
+            "vol": "🔧 VOLUME НАСТРОЙКИ"
+        }
+        await update.message.reply_text(
+            f"✅ СОХРАНЕНО: {key.upper()} = {value}\n\n{menu_text[mode]}",
+            reply_markup=menu_map[mode]()
+        )
+    except Exception as e:
+        print(f"Text handler error: {e}")
+        await update.message.reply_text("❌ ОШИБКА ВВОДА")
+
+async def post_init(app):
+    async with aiohttp.ClientSession() as session:
+        symbols = await get_symbols(session)
+    asyncio.create_task(websocket_global())
+    asyncio.create_task(websocket_liquidations())
+    asyncio.create_task(scanner(app))
+
+app = Application.builder().token(TOKEN).post_init(post_init).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+print("🚀 BOT STARTED")
+app.run_polling(drop_pending_updates=True)
