@@ -4,6 +4,7 @@ import json
 import time
 import random
 import math
+import traceback
 from datetime import datetime
 import aiohttp
 import websockets
@@ -82,10 +83,9 @@ def rotate_proxy():
         return None
     available = [p for p in PROXY_LIST if p not in dead_proxies]
     if not available:
-        print("All proxies dead")
+        print("⚠️ All proxies dead")
         return None
     proxy = random.choice(available)
-    # print(f"PROXY: {proxy}")  # <-- УБРАЛ
     return proxy
 
 async def safe_request(session, url, params=None, retries=3):
@@ -94,14 +94,17 @@ async def safe_request(session, url, params=None, retries=3):
         try:
             async with session.get(url, params=params, timeout=10, proxy=proxy) as response:
                 if response.status in [403, 429]:
-                    # print(f"Status {response.status}. Rotating proxy.")  # <-- УБРАЛ
+                    print(f"⚠️ Status {response.status} for {url}")
                     if proxy:
                         dead_proxies.add(proxy)
                     await asyncio.sleep(1)
                     continue
+                if response.status != 200:
+                    print(f"⚠️ Status {response.status} for {url}")
+                    return None
                 return await response.json()
         except Exception as e:
-            # print(f"Request error: {e}. Rotating proxy.")  # <-- УБРАЛ
+            print(f"⚠️ REQUEST FAILED: {url} - {str(e)}")
             if proxy:
                 dead_proxies.add(proxy)
             await asyncio.sleep(1)
@@ -111,15 +114,17 @@ async def get_symbols(session):
     now = time.time()
     if symbols_cache["data"] and now - symbols_cache["time"] < 1800:
         return symbols_cache["data"]
+    print("🔄 Loading symbols...")
     data = await safe_request(session, BASE + "/fapi/v1/ticker/24hr")
     if not data:
+        print("❌ Failed to load symbols")
         return symbols_cache["data"] or []
     coins = [x for x in data if x["symbol"].endswith("USDT")]
     coins.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
     top_coins = [x["symbol"] for x in coins[:150]]
     symbols_cache["data"] = top_coins
     symbols_cache["time"] = now
-    print(f"Loaded top {len(top_coins)} coins")
+    print(f"✅ Loaded top {len(top_coins)} coins")
     return top_coins
 
 async def get_klines(session, symbol, interval, limit):
@@ -410,11 +415,13 @@ def can_send_signal(symbol, mode):
 async def scanner(app):
     async with aiohttp.ClientSession() as session:
         print("✅ Бот запущен и мониторит рынок...")
+        scan_count = 0
         while True:
             if scanner_running:
                 try:
                     symbols = await get_symbols(session)
-                    # print(f"🔄 Scanning {len(symbols)} coins...")  # <-- УБРАЛ
+                    scan_count += 1
+                    print(f"🔄 Scan #{scan_count} - checking {len(symbols)} coins...")
                     
                     for symbol in symbols:
                         s_pump = settings["pump"]
@@ -436,7 +443,9 @@ async def scanner(app):
                                 vol_ok = new_vol >= s_pump["volume"]
                                 oi_ok = oi and oi["change"] >= s_pump["oi"]
                                 
+                                # Логирование для отладки
                                 if price_ok and vol_ok and oi_ok:
+                                    print(f"✅ PUMP conditions met for {symbol}!")
                                     if can_send_signal(symbol, "pump"):
                                         await send_full_signal(session, app, symbol, "PUMP", {
                                             "price_change": price_change,
@@ -448,6 +457,9 @@ async def scanner(app):
                                             "klines": klines,
                                             "oi_data": oi
                                         })
+                                # else:
+                                #     if scan_count % 5 == 0:  # Логируем каждый 5-й проход для экономии
+                                #         print(f"🔍 {symbol} PUMP: price={price_change:.2f}% (need {s_pump['price']}%), vol={new_vol:,.0f} (need {s_pump['volume']:,}), oi={oi['change'] if oi else 0:.2f}% (need {s_pump['oi']}%)")
                         
                         # DUMP
                         if s_dump["active"]:
@@ -459,6 +471,7 @@ async def scanner(app):
                                 price_change = ((price_new - price_old) / price_old) * 100
                                 
                                 if price_change >= s_dump["price"]:
+                                    print(f"✅ DUMP conditions met for {symbol}!")
                                     if can_send_signal(symbol, "dump"):
                                         await send_full_signal(session, app, symbol, "DUMP", {
                                             "price_change": price_change,
@@ -478,6 +491,7 @@ async def scanner(app):
                                         all_old_ok = False
                                 new_vol = float(klines[-1][7])
                                 if all_old_ok and new_vol >= s_vol["min_new_volume"]:
+                                    print(f"✅ VOLUME conditions met for {symbol}!")
                                     if can_send_signal(symbol, "vol"):
                                         await send_full_signal(session, app, symbol, "VOLUME", {
                                             "new_vol": new_vol,
@@ -487,15 +501,17 @@ async def scanner(app):
                         
                         await asyncio.sleep(0.01)
                 except Exception as e:
-                    # print(f"SCAN ERROR: {e}")  # <-- УБРАЛ
-                    pass
+                    print(f"❌ SCAN ERROR: {e}")
+                    traceback.print_exc()
             await asyncio.sleep(30)
 
 # ========== ОТПРАВКА СИГНАЛА ==========
 async def send_full_signal(session, app, symbol, mode, data):
     try:
+        print(f"📡 Sending {mode} signal for {symbol}")
         ticker = await get_ticker(session, symbol)
         if not ticker:
+            print(f"❌ No ticker data for {symbol}")
             return
         futures_price = ticker["price"]
         spot_price = await get_spot_price(session, symbol)
@@ -630,8 +646,10 @@ OrderBook Pressure: {pressure}
             [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
         ])
         await app.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=keyboard)
+        print(f"✅ Signal {mode} for {symbol} sent successfully!")
     except Exception as e:
-        print(f"Send signal error {symbol}: {e}")
+        print(f"❌ Send signal error {symbol}: {e}")
+        traceback.print_exc()
 
 # ========== МЕНЮ ==========
 def main_menu():

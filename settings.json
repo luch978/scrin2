@@ -1,0 +1,21 @@
+{
+    "pump": {
+        "price": 2.0,
+        "time": 10,
+        "volume": 2000000,
+        "oi": 0.0,
+        "active": true
+    },
+    "dump": {
+        "price": 10.0,
+        "time": 20,
+        "active": true
+    },
+    "vol": {
+        "tf": "3m",
+        "candles": 10,
+        "max_old_volume": 700000,
+        "min_new_volume": 2000000,
+        "active": true
+    }
+}
