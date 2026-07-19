@@ -77,13 +77,11 @@ def save_settings():
 
 load_settings()
 
-# ========== ПРОКСИ - ВСЕГДА РАБОТАЮТ ==========
+# ========== ПРОКСИ - БЕЗ СПАМА ==========
 def rotate_proxy():
     if not PROXY_LIST:
         return None
-    proxy = random.choice(PROXY_LIST)
-    print(f"🔑 Using proxy: {proxy[:40]}...")
-    return proxy
+    return random.choice(PROXY_LIST)
 
 async def safe_request(session, url, params=None, retries=3):
     for attempt in range(retries):
