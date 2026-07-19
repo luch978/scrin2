@@ -5,20 +5,11 @@ import time
 import random
 import math
 import traceback
-import logging
 from datetime import datetime
 import aiohttp
 import websockets
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
-from telegram.error import Conflict, RetryAfter, TimedOut, NetworkError
-
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
 
 try:
     from config import TOKEN, CHAT_ID, BASE, PROXY_LIST
@@ -59,7 +50,6 @@ data_cache = {"oi": {}, "funding": {}, "klines": {}, "ticker": {}}
 rsi_cache = {}
 ws_cache = {}
 liquidation_cache = {}
-dead_proxies = set()
 CACHE_TTL = 30
 CACHE_TTL_OB = 5
 last_signal_time = {}
@@ -87,37 +77,52 @@ def save_settings():
 
 load_settings()
 
+# ========== ПРОКСИ - ВСЕГДА РАБОТАЮТ ==========
 def rotate_proxy():
     if not PROXY_LIST:
         return None
-    available = [p for p in PROXY_LIST if p not in dead_proxies]
-    if not available:
-        print("⚠️ All proxies dead")
-        return None
-    proxy = random.choice(available)
+    # Просто берем случайный прокси из списка
+    # НИКАКИХ dead_proxies - прокси ВСЕГДА РАБОТАЮТ
+    proxy = random.choice(PROXY_LIST)
+    print(f"🔑 Using proxy: {proxy[:40]}...")
     return proxy
 
 async def safe_request(session, url, params=None, retries=3):
-    proxy = rotate_proxy()
     for attempt in range(retries):
+        # НОВЫЙ ПРОКСИ НА КАЖДУЮ ПОПЫТКУ!
+        proxy = rotate_proxy()
+        
         try:
-            async with session.get(url, params=params, timeout=10, proxy=proxy) as response:
-                if response.status in [403, 429]:
-                    print(f"⚠️ Status {response.status} for {url}")
-                    if proxy:
-                        dead_proxies.add(proxy)
-                    await asyncio.sleep(1)
-                    continue
-                if response.status != 200:
-                    text = await response.text()
-                    print(f"⚠️ Status {response.status} for {url} - {text[:200]}")
-                    return None
-                return await response.json()
-        except Exception as e:
-            print(f"⚠️ REQUEST FAILED: {url} - {str(e)}")
             if proxy:
-                dead_proxies.add(proxy)
+                async with session.get(url, params=params, timeout=15, proxy=proxy) as response:
+                    if response.status in [403, 429, 451]:
+                        print(f"⚠️ Status {response.status} for {url}")
+                        await asyncio.sleep(1)
+                        continue
+                    if response.status != 200:
+                        text = await response.text()
+                        print(f"⚠️ Status {response.status} for {url} - {text[:100]}")
+                        await asyncio.sleep(1)
+                        continue
+                    return await response.json()
+            else:
+                async with session.get(url, params=params, timeout=15) as response:
+                    if response.status != 200:
+                        text = await response.text()
+                        print(f"⚠️ Status {response.status} for {url} - {text[:100]}")
+                        await asyncio.sleep(1)
+                        continue
+                    return await response.json()
+        except asyncio.TimeoutError:
+            print(f"⏰ Timeout on attempt {attempt+1}, retrying...")
             await asyncio.sleep(1)
+            continue
+        except Exception as e:
+            print(f"⚠️ Request error: {str(e)[:50]}")
+            await asyncio.sleep(1)
+            continue
+    
+    print(f"❌ All retries failed for {url}")
     return None
 
 async def get_symbols(session):
@@ -143,11 +148,7 @@ async def get_klines(session, symbol, interval, limit):
     if key in data_cache["klines"] and now - data_cache["klines"][key]["time"] < 60:
         return data_cache["klines"][key]["data"]
     
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
     data = await safe_request(session, BASE + "/fapi/v1/klines", params)
     
     if not data:
@@ -783,4 +784,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_for[query.message.chat_id] = (mode, key)
         await query.edit_message_text(f"📝 ВВЕДИТЕ ЗНАЧЕНИЕ ДЛЯ {key.upper()}:")
     else:
-        await query.edit_message_text("❌ НЕИЗВЕСТ
+        await query.edit_message_text("❌ НЕИЗВЕСТНАЯ КОМАНДА", reply_markup=main_menu())
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id not in waiting
