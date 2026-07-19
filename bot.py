@@ -5,161 +5,45 @@ import time
 import random
 import math
 import traceback
-import sys
-import sqlite3
-from datetime import datetime, timedelta
-from dataclasses import dataclass
-from typing import Optional, Dict, List
+from datetime import datetime
 import aiohttp
 import websockets
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 try:
-    from config import TOKEN, CHAT_ID, EXCHANGES, PROXY_LIST
+    from config import TOKEN, CHAT_ID, BASE, PROXY_LIST
 except:
     print("config.py not found. Using defaults.")
     TOKEN = "YOUR_BOT_TOKEN"
     CHAT_ID = "YOUR_CHAT_ID"
-    EXCHANGES = {
-        "binance": {"base": "https://fapi.binance.com", "name": "Binance"},
-        "mexc": {"base": "https://api.mexc.com", "name": "MEXC"}
-    }
+    BASE = "https://fapi.binance.com"
     PROXY_LIST = []
 
-# ========== БАЗА ДАННЫХ ==========
-def init_db():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    
-    # Таблица пользователей
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        subscription_end TEXT,
-        created_at TEXT,
-        is_admin INTEGER DEFAULT 0
-    )''')
-    
-    # Таблица настроек пользователей
-    c.execute('''CREATE TABLE IF NOT EXISTS user_settings (
-        user_id INTEGER,
-        exchange TEXT DEFAULT 'binance',
-        PRIMARY KEY (user_id)
-    )''')
-    
-    # Добавляем админа (создателя)
-    c.execute('''INSERT OR IGNORE INTO users (user_id, username, is_admin, created_at)
-                 VALUES (?, ?, 1, ?)''', (int(CHAT_ID), "admin", datetime.now().isoformat()))
-    
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ========== ФУНКЦИИ БАЗЫ ДАННЫХ ==========
-def get_user(user_id):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = c.fetchone()
-    conn.close()
-    return user
-
-def add_user(user_id, username, first_name):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute('''INSERT OR IGNORE INTO users (user_id, username, first_name, created_at)
-                 VALUES (?, ?, ?, ?)''', (user_id, username, first_name, datetime.now().isoformat()))
-    # По умолчанию даем 3 дня бесплатно
-    c.execute('''UPDATE users SET subscription_end = ? 
-                 WHERE user_id = ? AND subscription_end IS NULL''', 
-              ((datetime.now() + timedelta(days=3)).isoformat(), user_id))
-    conn.commit()
-    conn.close()
-
-def has_subscription(user_id):
-    user = get_user(user_id)
-    if not user:
-        return False
-    # user[3] - subscription_end
-    if user[3] is None:
-        return False
-    end_date = datetime.fromisoformat(user[3])
-    return end_date > datetime.now()
-
-def get_exchange(user_id):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT exchange FROM user_settings WHERE user_id = ?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return result[0] if result else "binance"
-
-def set_exchange(user_id, exchange):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute('''INSERT OR REPLACE INTO user_settings (user_id, exchange) VALUES (?, ?)''', 
-              (user_id, exchange))
-    conn.commit()
-    conn.close()
-
-def set_subscription(user_id, days):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    new_date = (datetime.now() + timedelta(days=days)).isoformat()
-    c.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (new_date, user_id))
-    conn.commit()
-    conn.close()
-
-def remove_subscription(user_id):
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("UPDATE users SET subscription_end = NULL WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
-
-def get_all_users():
-    conn = sqlite3.connect("users.db")
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, first_name, subscription_end FROM users WHERE is_admin = 0")
-    users = c.fetchall()
-    conn.close()
-    return users
-
-def is_admin(user_id):
-    user = get_user(user_id)
-    return user and user[5] == 1  # is_admin
-
-# ========== НАСТРОЙКИ ==========
 settings = {
     "pump": {
-        "price": 1.0,
+        "price": 0.5,
         "time": 5,
-        "volume": 2000000,
-        "oi": 5.0,
-        "active": False
+        "volume": 100000,
+        "oi": 0.0,
+        "active": True
     },
     "dump": {
-        "price": 10.0,
-        "time": 20,
-        "active": False
+        "price": 3.0,
+        "time": 10,
+        "active": True
     },
     "vol": {
         "tf": "3m",
         "candles": 10,
-        "max_old_volume": 700000,
-        "min_new_volume": 2000000,
-        "active": False
+        "max_old_volume": 500000,
+        "min_new_volume": 1000000,
+        "active": True
     }
 }
 
 waiting_for = {}
 scanner_running = True
-current_exchange = "binance"  # По умолчанию
-
-# Кэши
 orderbook_cache = {}
 symbols_cache = {"data": [], "time": 0}
 data_cache = {"oi": {}, "funding": {}, "klines": {}, "ticker": {}}
@@ -227,403 +111,390 @@ async def safe_request(session, url, params=None, retries=3):
             await asyncio.sleep(1)
     return None
 
-def get_exchange_config(exchange_name):
-    return EXCHANGES.get(exchange_name, EXCHANGES["binance"])
-
-async def get_symbols(session, exchange="binance"):
+async def get_symbols(session):
     now = time.time()
-    key = f"symbols_{exchange}"
-    if symbols_cache.get(key) and now - symbols_cache.get(f"{key}_time", 0) < 1800:
-        return symbols_cache[key]
-    
-    config = get_exchange_config(exchange)
-    base = config["base"]
-    
-    print(f"🔄 Loading symbols from {exchange}...")
-    
-    # Разные эндпоинты для разных бирж
-    if exchange == "binance":
-        data = await safe_request(session, base + "/fapi/v1/ticker/24hr")
-        if not data:
-            return []
-        coins = [x for x in data if x["symbol"].endswith("USDT")]
-        coins.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-        top_coins = [x["symbol"] for x in coins[:150]]
-    elif exchange == "mexc":
-        data = await safe_request(session, base + "/api/v3/ticker/24hr")
-        if not data:
-            return []
-        coins = [x for x in data if x["symbol"].endswith("USDT")]
-        coins.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-        top_coins = [x["symbol"] for x in coins[:150]]
-    else:
-        return []
-    
-    symbols_cache[key] = top_coins
-    symbols_cache[f"{key}_time"] = now
-    print(f"✅ Loaded top {len(top_coins)} coins from {exchange}")
+    if symbols_cache["data"] and now - symbols_cache["time"] < 1800:
+        return symbols_cache["data"]
+    print("🔄 Loading symbols...")
+    data = await safe_request(session, BASE + "/fapi/v1/ticker/24hr")
+    if not data:
+        print("❌ Failed to load symbols")
+        return symbols_cache["data"] or []
+    coins = [x for x in data if x["symbol"].endswith("USDT")]
+    coins.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+    top_coins = [x["symbol"] for x in coins[:150]]
+    symbols_cache["data"] = top_coins
+    symbols_cache["time"] = now
+    print(f"✅ Loaded top {len(top_coins)} coins")
     return top_coins
 
-async def get_klines(session, symbol, interval, limit, exchange="binance"):
-    config = get_exchange_config(exchange)
-    base = config["base"]
-    key = f"klines_{exchange}_{symbol}_{interval}_{limit}"
+async def get_klines(session, symbol, interval, limit):
+    key = f"{symbol}_{interval}_{limit}"
     now = time.time()
-    
-    if key in data_cache and now - data_cache[key]["time"] < 60:
-        return data_cache[key]["data"]
+    if key in data_cache["klines"] and now - data_cache["klines"][key]["time"] < 60:
+        return data_cache["klines"][key]["data"]
     
     params = {"symbol": symbol, "interval": interval, "limit": limit}
-    
-    if exchange == "binance":
-        url = base + "/fapi/v1/klines"
-    elif exchange == "mexc":
-        url = base + "/api/v3/klines"
-    else:
-        return []
-    
-    data = await safe_request(session, url, params)
+    data = await safe_request(session, BASE + "/fapi/v1/klines", params)
     if not data:
-        print(f"⚠️ No klines data for {symbol} {interval} {limit} on {exchange}")
+        print(f"⚠️ No klines data for {symbol} {interval} {limit}")
         data = []
     
-    data_cache[key] = {"data": data, "time": now}
+    data_cache["klines"][key] = {"data": data, "time": now}
     return data
 
-async def get_ticker(session, symbol, exchange="binance"):
-    config = get_exchange_config(exchange)
-    base = config["base"]
+async def get_open_interest(session, symbol, interval_minutes=5):
     now = time.time()
-    key = f"ticker_{exchange}_{symbol}"
+    cache_key = f"{symbol}_{interval_minutes}"
+    if cache_key in data_cache["oi"] and now - data_cache["oi"][cache_key]["time"] < CACHE_TTL:
+        return data_cache["oi"][cache_key]["data"]
     
-    if key in data_cache and now - data_cache[key]["time"] < CACHE_TTL:
-        return data_cache[key]["data"]
-    
-    if exchange == "binance":
-        url = base + "/fapi/v1/ticker/24hr"
-    elif exchange == "mexc":
-        url = base + "/api/v3/ticker/24hr"
+    data = await safe_request(session, BASE + "/fapi/v1/openInterest", {"symbol": symbol})
+    if not data:
+        result = None
     else:
-        return None
+        oi_current = float(data.get("openInterest", 0))
+        ticker = await get_ticker(session, symbol)
+        price = ticker["price"] if ticker else 0
+        oi_usdt = oi_current * price
+        result = {"current": round(oi_usdt, 2), "change": 0}
     
-    data = await safe_request(session, url, {"symbol": symbol})
+    data_cache["oi"][cache_key] = {"data": result, "time": now}
+    return result
+
+async def get_ticker(session, symbol):
+    now = time.time()
+    if symbol in data_cache["ticker"] and now - data_cache["ticker"][symbol]["time"] < CACHE_TTL:
+        return data_cache["ticker"][symbol]["data"]
+    data = await safe_request(session, BASE + "/fapi/v1/ticker/24hr", {"symbol": symbol})
     if data:
         result = {
             "price": float(data.get("lastPrice", 0)),
             "volume": float(data.get("quoteVolume", 0))
         }
-        data_cache[key] = {"data": result, "time": now}
+        data_cache["ticker"][symbol] = {"data": result, "time": now}
         return result
     return None
 
-# ========== АДМИН-КОМАНДЫ ==========
-async def admin_add_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    try:
-        args = context.args
-        if len(args) < 2:
-            await update.message.reply_text("📝 Использование: /add_subscription <user_id> <days>\nПример: /add_subscription 123456789 30")
-            return
-        
-        target_user = int(args[0])
-        days = int(args[1])
-        
-        set_subscription(target_user, days)
-        await update.message.reply_text(f"✅ Пользователю {target_user} добавлена подписка на {days} дней")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+def calculate_rsi_from_klines(klines, period=14):
+    if len(klines) < period + 1:
+        return 50
+    gains, losses = 0, 0
+    for i in range(1, period + 1):
+        change = float(klines[i][4]) - float(klines[i-1][4])
+        if change > 0:
+            gains += change
+        else:
+            losses += abs(change)
+    if losses == 0:
+        return 100
+    rs = gains / losses
+    return round(100 - (100 / (1 + rs)), 2)
 
-async def admin_remove_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    try:
-        args = context.args
-        if len(args) < 1:
-            await update.message.reply_text("📝 Использование: /remove_subscription <user_id>")
-            return
-        
-        target_user = int(args[0])
-        remove_subscription(target_user)
-        await update.message.reply_text(f"✅ Подписка пользователя {target_user} удалена")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+async def get_rsi(session, symbol, interval, period=14):
+    key = f"{symbol}_{interval}_{period}"
+    if key in rsi_cache and time.time() - rsi_cache[key]["time"] < 60:
+        return rsi_cache[key]["data"]
+    klines = await get_klines(session, symbol, interval, period + 1)
+    rsi = calculate_rsi_from_klines(klines, period)
+    rsi_cache[key] = {"data": rsi, "time": time.time()}
+    return rsi
 
-async def admin_list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    users = get_all_users()
-    if not users:
-        await update.message.reply_text("📊 Нет пользователей")
-        return
-    
-    msg = "📊 СПИСОК ПОЛЬЗОВАТЕЛЕЙ\n\n"
-    for u in users:
-        user_id, username, first_name, sub_end = u
-        status = "✅" if sub_end and datetime.fromisoformat(sub_end) > datetime.now() else "❌"
-        end_str = sub_end[:10] if sub_end else "Нет"
-        msg += f"ID: {user_id}\nИмя: {first_name or username or 'Без имени'}\nСтатус: {status}\nДо: {end_str}\n\n"
-    
-    # Отправка по частям, если сообщение длинное
-    if len(msg) > 4000:
-        for i in range(0, len(msg), 4000):
-            await update.message.reply_text(msg[i:i+4000])
-    else:
-        await update.message.reply_text(msg)
-
-async def admin_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("❌ Нет прав!")
-        return
-    
-    args = context.args
-    if not args:
-        await update.message.reply_text("📝 Использование: /broadcast <сообщение>")
-        return
-    
-    message = " ".join(args)
-    users = get_all_users()
-    sent = 0
-    
-    for u in users:
+async def websocket_global():
+    url = "wss://fstream.binance.com/ws/!bookTicker@arr"
+    while True:
         try:
-            await context.bot.send_message(chat_id=u[0], text=f"📢 АНОНС:\n\n{message}")
-            sent += 1
-            await asyncio.sleep(0.1)
-        except:
-            pass
-    
-    await update.message.reply_text(f"✅ Рассылка отправлена {sent} пользователям")
+            async with websockets.connect(url) as ws:
+                print("✅ Global WebSocket connected")
+                async for msg in ws:
+                    data = json.loads(msg)
+                    if isinstance(data, list):
+                        for item in data:
+                            symbol = item.get("s")
+                            if symbol:
+                                ws_cache[symbol] = {
+                                    "time": time.time(),
+                                    "bid": float(item.get("b", 0)),
+                                    "ask": float(item.get("a", 0)),
+                                    "bid_qty": float(item.get("B", 0)),
+                                    "ask_qty": float(item.get("A", 0))
+                                }
+        except Exception as e:
+            print(f"❌ Global WS error: {e}")
+            await asyncio.sleep(5)
+
+async def websocket_liquidations():
+    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+    while True:
+        try:
+            async with websockets.connect(url) as ws:
+                print("✅ Liquidation WS connected")
+                async for msg in ws:
+                    data = json.loads(msg)
+                    payload = data.get("data", data)
+                    if "o" not in payload:
+                        continue
+                    order = payload["o"]
+                    symbol = order["s"]
+                    side = order["S"]
+                    price = float(order["ap"])
+                    qty = float(order["q"])
+                    usdt = price * qty
+                    if symbol not in liquidation_cache:
+                        liquidation_cache[symbol] = []
+                    liquidation_cache[symbol].append({
+                        "time": time.time(),
+                        "side": side,
+                        "usdt": usdt
+                    })
+                    liquidation_cache[symbol] = [
+                        x for x in liquidation_cache[symbol]
+                        if time.time() - x["time"] < 1200
+                    ]
+        except Exception as e:
+            print("Liquidation WS:", e)
+            await asyncio.sleep(5)
+
+def get_liquidations(symbol):
+    if symbol not in liquidation_cache:
+        return 0, 0
+    long_liq = 0
+    short_liq = 0
+    for x in liquidation_cache[symbol]:
+        if x["side"] == "SELL":
+            long_liq += x["usdt"]
+        elif x["side"] == "BUY":
+            short_liq += x["usdt"]
+    return round(long_liq, 2), round(short_liq, 2)
+
+def analyze_ws_data(symbol):
+    entry = ws_cache.get(symbol)
+    if not entry:
+        return None
+    bid = entry["bid"]
+    ask = entry["ask"]
+    bid_vol = bid * entry["bid_qty"]
+    ask_vol = ask * entry["ask_qty"]
+    total = bid_vol + ask_vol
+    if total == 0:
+        imbalance = 50
+    else:
+        imbalance = bid_vol / total * 100
+    ratio = bid_vol / max(ask_vol, 1)
+    return {
+        "bid": bid,
+        "ask": ask,
+        "spread": round((ask - bid) / bid * 100, 4),
+        "bid_vol": round(bid_vol, 2),
+        "ask_vol": round(ask_vol, 2),
+        "imbalance": round(imbalance, 1),
+        "ratio": round(ratio, 2),
+        "delta": round(bid_vol - ask_vol, 2)
+    }
+
+def can_send_signal(symbol, mode):
+    key = f"{symbol}_{mode}"
+    now = time.time()
+    if key in last_signal_time:
+        if now - last_signal_time[key] < 60:
+            return False
+    last_signal_time[key] = now
+    return True
+
+# ========== СКАНЕР ==========
+async def scanner(app):
+    async with aiohttp.ClientSession() as session:
+        print("✅ Бот запущен и мониторит рынок...")
+        scan_count = 0
+        while True:
+            if scanner_running:
+                try:
+                    symbols = await get_symbols(session)
+                    scan_count += 1
+                    print(f"🔄 Scan #{scan_count} - checking {len(symbols)} coins...")
+                    
+                    for symbol in symbols:
+                        s_pump = settings["pump"]
+                        s_dump = settings["dump"]
+                        s_vol = settings["vol"]
+                        
+                        # PUMP
+                        if s_pump["active"]:
+                            klines = await get_klines(session, symbol, "1m", s_pump["time"] + 1)
+                            if len(klines) >= s_pump["time"] + 1:
+                                price_old = float(klines[0][4])
+                                price_new = float(klines[-1][4])
+                                price_change = ((price_new - price_old) / price_old) * 100
+                                new_vol = float(klines[-1][7])
+                                oi = await get_open_interest(session, symbol, s_pump["time"])
+                                
+                                price_ok = price_change >= s_pump["price"]
+                                vol_ok = new_vol >= s_pump["volume"]
+                                oi_ok = oi and oi["change"] >= s_pump["oi"] if oi else False
+                                
+                                if price_ok and vol_ok and oi_ok:
+                                    print(f"✅ PUMP conditions met for {symbol}!")
+                                    if can_send_signal(symbol, "pump"):
+                                        await send_full_signal(session, app, symbol, "PUMP", {
+                                            "price_change": price_change,
+                                            "new_vol": new_vol,
+                                            "oi_change": oi["change"] if oi else 0,
+                                            "time_minutes": s_pump["time"]
+                                        })
+                        
+                        # DUMP
+                        if s_dump["active"]:
+                            klines = await get_klines(session, symbol, "1m", s_dump["time"] + 1)
+                            if len(klines) >= s_dump["time"] + 1:
+                                price_old = float(klines[0][4])
+                                price_new = float(klines[-1][4])
+                                price_change = ((price_new - price_old) / price_old) * 100
+                                
+                                if price_change >= s_dump["price"]:
+                                    print(f"✅ DUMP conditions met for {symbol}!")
+                                    if can_send_signal(symbol, "dump"):
+                                        await send_full_signal(session, app, symbol, "DUMP", {
+                                            "price_change": price_change,
+                                            "time_minutes": s_dump["time"]
+                                        })
+                        
+                        # VOLUME
+                        if s_vol["active"]:
+                            klines = await get_klines(session, symbol, s_vol["tf"], s_vol["candles"] + 1)
+                            if len(klines) >= s_vol["candles"] + 1:
+                                all_old_ok = True
+                                old_vols = []
+                                for c in klines[:-1]:
+                                    vol = float(c[7])
+                                    old_vols.append(vol)
+                                    if vol > s_vol["max_old_volume"]:
+                                        all_old_ok = False
+                                new_vol = float(klines[-1][7])
+                                if all_old_ok and new_vol >= s_vol["min_new_volume"]:
+                                    print(f"✅ VOLUME conditions met for {symbol}!")
+                                    if can_send_signal(symbol, "vol"):
+                                        await send_full_signal(session, app, symbol, "VOLUME", {
+                                            "new_vol": new_vol,
+                                            "old_vols": old_vols
+                                        })
+                        
+                        await asyncio.sleep(0.01)
+                except Exception as e:
+                    print(f"❌ SCAN ERROR: {e}")
+                    traceback.print_exc()
+            await asyncio.sleep(30)
+
+# ========== ОТПРАВКА СИГНАЛА ==========
+async def send_full_signal(session, app, symbol, mode, data):
+    try:
+        print(f"📡 Sending {mode} signal for {symbol}")
+        ticker = await get_ticker(session, symbol)
+        if not ticker:
+            print(f"❌ No ticker data for {symbol}")
+            return
+        
+        futures_price = ticker["price"]
+        
+        rsi_1m = await get_rsi(session, symbol, "1m")
+        rsi_5m = await get_rsi(session, symbol, "5m")
+        rsi_15m = await get_rsi(session, symbol, "15m")
+        rsi_1h = await get_rsi(session, symbol, "1h")
+        
+        long_liq, short_liq = get_liquidations(symbol)
+        ws = analyze_ws_data(symbol)
+        
+        emoji = "🚀" if mode == "PUMP" else "🔥" if mode == "DUMP" else "📦"
+        
+        msg = f"""{emoji} {mode} SIGNAL
+
+📊 {symbol}
+"""
+        
+        if mode == "PUMP":
+            price_change = data.get("price_change", 0)
+            new_vol = data.get("new_vol", 0)
+            oi_change = data.get("oi_change", 0)
+            time_minutes = data.get("time_minutes", settings['pump']['time'])
+            msg += f"""
+✔ Price: +{price_change:.2f}% (≥ {settings['pump']['price']}%)
+✔ Volume: {new_vol:,.0f} USDT
+✔ OI: +{oi_change:.2f}%
+✔ Period: {time_minutes} min
+"""
+        elif mode == "DUMP":
+            price_change = data.get("price_change", 0)
+            time_minutes = data.get("time_minutes", settings['dump']['time'])
+            msg += f"""
+✔ Price Growth: +{price_change:.2f}% (≥ {settings['dump']['price']}%)
+✔ Period: {time_minutes} min
+"""
+        elif mode == "VOLUME":
+            new_vol = data.get("new_vol", 0)
+            old_vols = data.get("old_vols", [])
+            avg_old = sum(old_vols) / len(old_vols) if old_vols else 0
+            msg += f"""
+✔ New Volume: {new_vol:,.0f} USDT
+✔ Avg Old Volume: {avg_old:,.0f} USDT
+✔ Growth: {new_vol/avg_old*100:.1f}x
+✔ TF: {settings['vol']['tf']}
+"""
+        
+        msg += "\n" + "-" * 40 + "\n"
+        
+        msg += f"""
+💲 Price: ${futures_price:.4f}
+
+📈 RSI:
+  1m: {rsi_1m:.1f} | 5m: {rsi_5m:.1f}
+  15m: {rsi_15m:.1f} | 1h: {rsi_1h:.1f}
+
+💥 Liquidations
+  LONG: {long_liq:,.0f} USDT
+  SHORT: {short_liq:,.0f} USDT
+"""
+        
+        if ws:
+            ratio = ws["ratio"]
+            if ratio >= 4:
+                pressure = "EXTREME BUY"
+            elif ratio >= 2.5:
+                pressure = "STRONG BUY"
+            elif ratio >= 1.4:
+                pressure = "BUY"
+            elif ratio <= 0.25:
+                pressure = "EXTREME SELL"
+            elif ratio <= 0.50:
+                pressure = "STRONG SELL"
+            elif ratio <= 0.75:
+                pressure = "SELL"
+            else:
+                pressure = "NEUTRAL"
+
+            msg += f"""
+⚡ OrderBook Pressure: {pressure}
+  Bid/Ask Ratio: {ratio:.2f}
+  Spread: {ws['spread']:.4f}%
+"""
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
+        ])
+        await app.bot.send_message(chat_id=CHAT_ID, text=msg, reply_markup=keyboard)
+        print(f"✅ Signal {mode} for {symbol} sent successfully!")
+    except Exception as e:
+        print(f"❌ Send signal error {symbol}: {e}")
+        traceback.print_exc()
 
 # ========== МЕНЮ ==========
-def main_menu(user_id):
+def main_menu():
     status = "RUNNING ✅" if scanner_running else "STOPPED ❌"
-    exchange = get_exchange(user_id)
-    exchange_name = EXCHANGES.get(exchange, {}).get("name", "Binance")
-    sub_active = has_subscription(user_id)
-    sub_status = "✅" if sub_active else "❌"
-    
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"⚡ СКАНЕР: {status}", callback_data="toggle_scanner")],
-        [InlineKeyboardButton(f"🏦 БИРЖА: {exchange_name}", callback_data="exchange_menu")],
-        [InlineKeyboardButton(f"💎 ПОДПИСКА: {sub_status}", callback_data="subscription_info")],
         [InlineKeyboardButton("📊 СТАТУС", callback_data="status")],
         [InlineKeyboardButton("🔧 PUMP", callback_data="pump_menu")],
         [InlineKeyboardButton("🔧 DUMP", callback_data="dump_menu")],
         [InlineKeyboardButton("🔧 VOL", callback_data="vol_menu")]
-    ]
-    
-    # Если админ - добавляем админ-панель
-    if is_admin(user_id):
-        keyboard.append([InlineKeyboardButton("👑 АДМИН-ПАНЕЛЬ", callback_data="admin_panel")])
-    
-    return InlineKeyboardMarkup(keyboard)
-
-def exchange_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🟡 Binance", callback_data="set_exchange_binance")],
-        [InlineKeyboardButton("🟣 MEXC", callback_data="set_exchange_mexc")],
-        [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
     ])
-
-def admin_panel():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Список пользователей", callback_data="admin_list")],
-        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
-    ])
-
-# ========== ОБРАБОТЧИКИ ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    username = update.message.from_user.username or "Без username"
-    first_name = update.message.from_user.first_name or "Без имени"
-    
-    add_user(user_id, username, first_name)
-    await update.message.reply_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu(user_id))
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global scanner_running, current_exchange
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-    
-    if data == "main":
-        await query.edit_message_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu(user_id))
-    
-    elif data == "exchange_menu":
-        await query.edit_message_text("🏦 ВЫБЕРИТЕ БИРЖУ", reply_markup=exchange_menu())
-    
-    elif data.startswith("set_exchange_"):
-        exchange = data.replace("set_exchange_", "")
-        if exchange in EXCHANGES:
-            set_exchange(user_id, exchange)
-            await query.edit_message_text(f"✅ Биржа изменена на {EXCHANGES[exchange]['name']}", 
-                                          reply_markup=main_menu(user_id))
-    
-    elif data == "subscription_info":
-        sub_active = has_subscription(user_id)
-        user = get_user(user_id)
-        if sub_active and user:
-            end_date = datetime.fromisoformat(user[3])
-            days_left = (end_date - datetime.now()).days
-            msg = f"💎 ПОДПИСКА\n\nСтатус: ✅ АКТИВНА\nДней осталось: {days_left}\nДо: {end_date.strftime('%d.%m.%Y')}"
-        else:
-            msg = "💎 ПОДПИСКА\n\nСтатус: ❌ НЕ АКТИВНА\n\nДля активации обратитесь к @admin"
-        await query.edit_message_text(msg, reply_markup=main_menu(user_id))
-    
-    elif data == "admin_panel":
-        if is_admin(user_id):
-            await query.edit_message_text("👑 АДМИН-ПАНЕЛЬ", reply_markup=admin_panel())
-    
-    elif data == "admin_list":
-        if is_admin(user_id):
-            users = get_all_users()
-            if not users:
-                await query.edit_message_text("📊 Нет пользователей", reply_markup=admin_panel())
-                return
-            msg = "📊 ПОЛЬЗОВАТЕЛИ\n\n"
-            for u in users:
-                sub = "✅" if u[3] and datetime.fromisoformat(u[3]) > datetime.now() else "❌"
-                msg += f"ID: {u[0]}\nИмя: {u[1] or u[2] or 'Без имени'}\nСтатус: {sub}\n\n"
-            await query.edit_message_text(msg[:4000], reply_markup=admin_panel())
-    
-    elif data == "admin_broadcast":
-        if is_admin(user_id):
-            waiting_for[user_id] = ("broadcast",)
-            await query.edit_message_text("📝 ВВЕДИТЕ ТЕКСТ ДЛЯ РАССЫЛКИ:", reply_markup=admin_panel())
-    
-    elif data == "toggle_scanner":
-        scanner_running = not scanner_running
-        await query.edit_message_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu(user_id))
-    
-    elif data == "status":
-        await query.edit_message_text(status_text(user_id), reply_markup=main_menu(user_id))
-    
-    elif data == "pump_menu":
-        await query.edit_message_text("🔧 PUMP НАСТРОЙКИ", reply_markup=pump_menu())
-    elif data == "dump_menu":
-        await query.edit_message_text("🔧 DUMP НАСТРОЙКИ", reply_markup=dump_menu())
-    elif data == "vol_menu":
-        await query.edit_message_text("🔧 VOLUME НАСТРОЙКИ", reply_markup=vol_menu())
-    
-    elif data.endswith("_start"):
-        mode = data.split("_")[0]
-        settings[mode]["active"] = True
-        save_settings()
-        await query.edit_message_text(f"✅ {mode.upper()} ЗАПУЩЕН", reply_markup=main_menu(user_id))
-    
-    elif data.endswith("_stop"):
-        mode = data.split("_")[0]
-        settings[mode]["active"] = False
-        save_settings()
-        await query.edit_message_text(f"❌ {mode.upper()} ОСТАНОВЛЕН", reply_markup=main_menu(user_id))
-    
-    elif "_" in data:
-        mode, key = data.split("_", 1)
-        waiting_for[query.message.chat_id] = (mode, key)
-        await query.edit_message_text(f"📝 ВВЕДИТЕ ЗНАЧЕНИЕ ДЛЯ {key.upper()}:")
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    user_id = update.message.from_user.id
-    
-    if chat_id not in waiting_for:
-        return
-    
-    waiting = waiting_for[chat_id]
-    
-    # Обработка рассылки
-    if waiting == ("broadcast",):
-        if not is_admin(user_id):
-            return
-        message = update.message.text
-        users = get_all_users()
-        sent = 0
-        for u in users:
-            try:
-                await context.bot.send_message(chat_id=u[0], text=f"📢 АНОНС:\n\n{message}")
-                sent += 1
-                await asyncio.sleep(0.1)
-            except:
-                pass
-        await update.message.reply_text(f"✅ Рассылка отправлена {sent} пользователям")
-        del waiting_for[chat_id]
-        return
-    
-    # Обработка настроек
-    mode, key = waiting
-    try:
-        if key == "tf":
-            value = update.message.text.strip()
-            if value not in ["1m", "3m", "5m"]:
-                await update.message.reply_text("❌ ТОЛЬКО: 1m, 3m, 5m")
-                return
-        else:
-            value = float(update.message.text.replace(",", "."))
-            if key in ["candles", "time"]:
-                value = int(value)
-        
-        settings[mode][key] = value
-        del waiting_for[chat_id]
-        save_settings()
-        
-        menu_map = {"pump": pump_menu, "dump": dump_menu, "vol": vol_menu}
-        menu_text = {"pump": "🔧 PUMP НАСТРОЙКИ", "dump": "🔧 DUMP НАСТРОЙКИ", "vol": "🔧 VOLUME НАСТРОЙКИ"}
-        
-        await update.message.reply_text(
-            f"✅ СОХРАНЕНО: {key.upper()} = {value}\n\n{menu_text[mode]}",
-            reply_markup=menu_map[mode]()
-        )
-    except Exception as e:
-        print(f"Text handler error: {e}")
-        await update.message.reply_text("❌ ОШИБКА ВВОДА")
-
-# ========== ОСТАЛЬНЫЕ ФУНКЦИИ ==========
-def status_text(user_id):
-    total = len(symbols_cache.get("data", [])) if symbols_cache.get("data") else 0
-    status = "RUNNING ✅" if scanner_running else "STOPPED ❌"
-    exchange = get_exchange(user_id)
-    exchange_name = EXCHANGES.get(exchange, {}).get("name", "Binance")
-    
-    return f"""
-📊 СТАТУС СКАНЕРА
-==================
-⚡ СКАНЕР: {status}
-🏦 БИРЖА: {exchange_name}
-
-🔧 PUMP
-  Цена: {settings['pump']['price']}%
-  Время: {settings['pump']['time']} мин
-  Объём: {settings['pump']['volume']:,} USDT
-  OI: {settings['pump']['oi']}%
-  Активен: {'✅' if settings['pump']['active'] else '❌'}
-
-🔧 DUMP
-  Цена: {settings['dump']['price']}%
-  Время: {settings['dump']['time']} мин
-  Активен: {'✅' if settings['dump']['active'] else '❌'}
-
-🔧 VOLUME
-  TF: {settings['vol']['tf']}
-  Свечей: {settings['vol']['candles']}
-  Max Vol: {settings['vol']['max_old_volume']:,} USDT
-  Min Vol: {settings['vol']['min_new_volume']:,} USDT
-  Активен: {'✅' if settings['vol']['active'] else '❌'}
-
-📊 МОНЕТ: {total}
-"""
 
 def pump_menu():
     return InlineKeyboardMarkup([
@@ -656,18 +527,115 @@ def vol_menu():
         [InlineKeyboardButton("📊 МЕНЮ", callback_data="main")]
     ])
 
+def status_text():
+    total = len(symbols_cache["data"]) if symbols_cache["data"] else 0
+    status = "RUNNING ✅" if scanner_running else "STOPPED ❌"
+    return f"""
+📊 СТАТУС СКАНЕРА
+==================
+⚡ СКАНЕР: {status}
+
+🔧 PUMP
+  Цена: {settings['pump']['price']}%
+  Время: {settings['pump']['time']} мин
+  Объём: {settings['pump']['volume']:,} USDT
+  OI: {settings['pump']['oi']}%
+  Активен: {'✅' if settings['pump']['active'] else '❌'}
+
+🔧 DUMP
+  Цена: {settings['dump']['price']}%
+  Время: {settings['dump']['time']} мин
+  Активен: {'✅' if settings['dump']['active'] else '❌'}
+
+🔧 VOLUME
+  TF: {settings['vol']['tf']}
+  Свечей: {settings['vol']['candles']}
+  Max Vol: {settings['vol']['max_old_volume']:,} USDT
+  Min Vol: {settings['vol']['min_new_volume']:,} USDT
+  Активен: {'✅' if settings['vol']['active'] else '❌'}
+
+📊 МОНЕТ: {total}
+"""
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu())
+
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global scanner_running
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    if data == "main":
+        await query.edit_message_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu())
+    elif data == "toggle_scanner":
+        scanner_running = not scanner_running
+        await query.edit_message_text("📊 ГЛАВНОЕ МЕНЮ", reply_markup=main_menu())
+    elif data == "status":
+        await query.edit_message_text(status_text(), reply_markup=main_menu())
+    elif data == "pump_menu":
+        await query.edit_message_text("🔧 PUMP НАСТРОЙКИ", reply_markup=pump_menu())
+    elif data == "dump_menu":
+        await query.edit_message_text("🔧 DUMP НАСТРОЙКИ", reply_markup=dump_menu())
+    elif data == "vol_menu":
+        await query.edit_message_text("🔧 VOLUME НАСТРОЙКИ", reply_markup=vol_menu())
+    elif data.endswith("_start"):
+        mode = data.split("_")[0]
+        settings[mode]["active"] = True
+        save_settings()
+        await query.edit_message_text(f"✅ {mode.upper()} ЗАПУЩЕН", reply_markup=main_menu())
+    elif data.endswith("_stop"):
+        mode = data.split("_")[0]
+        settings[mode]["active"] = False
+        save_settings()
+        await query.edit_message_text(f"❌ {mode.upper()} ОСТАНОВЛЕН", reply_markup=main_menu())
+    elif "_" in data:
+        mode, key = data.split("_", 1)
+        waiting_for[query.message.chat_id] = (mode, key)
+        await query.edit_message_text(f"📝 ВВЕДИТЕ ЗНАЧЕНИЕ ДЛЯ {key.upper()}:")
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id not in waiting_for:
+        return
+    mode, key = waiting_for[chat_id]
+    try:
+        if key == "tf":
+            value = update.message.text.strip()
+            if value not in ["1m", "3m", "5m"]:
+                await update.message.reply_text("❌ ТОЛЬКО: 1m, 3m, 5m")
+                return
+        else:
+            value = float(update.message.text.replace(",", "."))
+            if key in ["candles", "time"]:
+                value = int(value)
+        settings[mode][key] = value
+        del waiting_for[chat_id]
+        save_settings()
+        
+        menu_map = {"pump": pump_menu, "dump": dump_menu, "vol": vol_menu}
+        menu_text = {"pump": "🔧 PUMP НАСТРОЙКИ", "dump": "🔧 DUMP НАСТРОЙКИ", "vol": "🔧 VOLUME НАСТРОЙКИ"}
+        
+        await update.message.reply_text(
+            f"✅ СОХРАНЕНО: {key.upper()} = {value}\n\n{menu_text[mode]}",
+            reply_markup=menu_map[mode]()
+        )
+    except Exception as e:
+        print(f"Text handler error: {e}")
+        await update.message.reply_text("❌ ОШИБКА ВВОДА")
+
+async def post_init(app):
+    async with aiohttp.ClientSession() as session:
+        symbols = await get_symbols(session)
+    asyncio.create_task(websocket_global())
+    asyncio.create_task(websocket_liquidations())
+    asyncio.create_task(scanner(app))
+
 # ========== ЗАПУСК ==========
-app = Application.builder().token(TOKEN).build()
-
-# Команды
+app = Application.builder().token(TOKEN).post_init(post_init).build()
 app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("add_subscription", admin_add_subscription))
-app.add_handler(CommandHandler("remove_subscription", admin_remove_subscription))
-app.add_handler(CommandHandler("list_users", admin_list_users))
-app.add_handler(CommandHandler("broadcast", admin_broadcast))
-
 app.add_handler(CallbackQueryHandler(button))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
-print("🚀 BOT STARTED WITH MULTI-USER SUPPORT!")
-app.run_polling()
+print("🚀 BOT STARTED")
+app.run_polling(drop_pending_updates=True)
